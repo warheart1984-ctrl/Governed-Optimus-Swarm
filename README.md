@@ -17,6 +17,32 @@ A governed multi-robot swarm simulation framework featuring strict law enforceme
 - `swarm_core.py` – Lightweight mining swarm reference
 - `mining_scenario.py` – Example instantiation of the mining swarm
 
+## Memoryboard + RAG adapter
+
+The swarm can persist and recall governed memory through the Jarvis Memoryboard
+(EMR continuity ledger) and its AMUL RAG knowledge base via
+`memoryboard_adapter.py`. The adapter is a thin, fail-closed HTTP client:
+
+- `remember(...)` — persist a swarm event as a governed **draft** memory (EMR
+  write gateway; autonomous `user_requested=False` writes are refused by design).
+- `recall(...)` / `retrieve(...)` — EMR governed retrieval into swarm context.
+- `rag_query(...)` — query the AMUL RAG knowledge base for governed facts.
+- Offline by default (`offline_ok=True`): degrades to offline markers instead of
+  crashing the swarm. Set `JARVIS_MEMORYBOARD_URL` when a memoryboard is running.
+
+```bash
+# Run the governed swarm + memoryboard adapter demo
+python governed_swarm_memory_demo.py
+
+# Run adapter tests (no live memoryboard required — uses a local stub server)
+python -m pytest test_memoryboard_adapter.py -q
+```
+
+Project structure additions:
+- `memoryboard_adapter.py` – Jarvis Memoryboard (EMR) + RAG integration adapter
+- `governed_swarm_memory_demo.py` – Governed swarm wired to the memoryboard
+- `test_memoryboard_adapter.py` – Adapter tests (stub HTTP server)
+
 ## Quick Start
 ```bash
 # Clone the repository
