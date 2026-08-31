@@ -32,6 +32,7 @@ from omnisim_seam import (
     OmniSimMobile,
     SPAWN_LOCATIONS,
     WAYPOINTS,
+    evaluate_completion_gate,
 )
 
 
@@ -48,11 +49,12 @@ class FakeMobile:
         self.dispatches: list[dict] = []
         self.observe_calls = 0
 
-    def dispatch(self, assignment: Assignment) -> dict:
+    def dispatch(self, assignment: Assignment, start_pose=None) -> dict:
         record = {
             "robot_id": assignment.robot_id,
             "policy": assignment.policy,
             "target": assignment.target,
+            "start_pose": start_pose,
         }
         self.dispatches.append(record)
         if self.outcome == "transport_error":
@@ -282,7 +284,71 @@ def test_drive_timeout_covers_distance_and_settling():
     captured = {}
     mobile._post = lambda path, body, timeout_s=None: captured.update(timeout_s=timeout_s) or {}  # type: ignore[method-assign]
     mobile.dispatch(Assignment("robot_a", "go_to_far", "far", "navigate", "req-far"))
-    assert captured["timeout_s"] == 27.0  # 24 m at 1 m/s, plus 3 s settling
+    assert captured["timeout_s"] == 27.0  # spawn fallback: 24 m at 1 m/s, plus 3 s settling
+
+
+def test_drive_timeout_uses_observed_start_pose():
+    """HTTP wait must be billed from the observed pose, not configured spawn."""
+    mobile = OmniSimMobile(
+        "robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"],
+        {"far": type(WAYPOINTS["wp_x"])("far", 20.0, -2.0)},
+        timeout_s=5.0, cruise_speed_mps=1.0, settle_timeout_s=3.0,
+    )
+    captured = {}
+    mobile._post = lambda path, body, timeout_s=None: captured.update(timeout_s=timeout_s) or {}  # type: ignore[method-assign]
+    # Spawn-to-goal is 24 m; observed start is 10 m from the goal.
+    mobile.dispatch(
+        Assignment("robot_a", "go_to_far", "far", "navigate", "req-far"),
+        start_pose={"pose": [10.0, -2.0], "yaw": 0.0},
+    )
+    assert captured["timeout_s"] == 13.0  # 10 m at 1 m/s, plus 3 s settling
+
+
+def test_implausible_start_pose_aborts_without_http():
+    waypoints = {"far": type(WAYPOINTS["wp_x"])("far", 600.0, 0.0)}
+    mobile = OmniSimMobile(
+        "robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"], waypoints,
+    )
+    posts: list = []
+    mobile._post = lambda *args, **kwargs: posts.append((args, kwargs)) or {}  # type: ignore[method-assign]
+    reply = mobile.dispatch(
+        Assignment("robot_a", "go_to_far", "far", "navigate", "req-far"),
+        start_pose={"pose": [0.0, 0.0], "yaw": 0.0},
+    )
+    assert posts == []
+    assert reply["error"] == "aborted"
+    assert reply["arrived"] is False
+
+
+def test_completion_gate_explains_each_flag():
+    completed = evaluate_completion_gate(
+        {"ok": True, "arrived": True, "settled": True, "timed_out": False},
+    )
+    assert completed["decision"] == "completed"
+    rejected = evaluate_completion_gate(
+        {"ok": True, "arrived": True, "settled": False, "timed_out": False},
+    )
+    assert rejected["decision"] == "rejected"
+    assert any("settled" in r for r in rejected["reasons"])
+    aborted = evaluate_completion_gate(
+        {"ok": False, "error": "aborted", "reason": "implausible route distance"},
+    )
+    assert aborted["decision"] == "aborted"
+
+
+def test_evidence_records_gate_snapshots_and_route_delta(adapter_factory):
+    ad = adapter_factory()
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    payload = rec.to_json()
+    assert payload["completion_gate"]["decision"] == "completed"
+    assert payload["completion_gate"]["reasons"]
+    assert len(payload["pose_snapshots"]) == 2
+    assert payload["pose_snapshots"][0]["label"] == "before"
+    assert "wall_time_iso" in payload["pose_snapshots"][0]
+    assert "remaining_before_m" in payload["route"]
+    assert "remaining_after_m" in payload["route"]
+    assert "route_distance_delta_m" in payload["route"]
 
 
 def test_rejected_attempt_captured_not_thrown(adapter_factory):

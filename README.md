@@ -61,9 +61,17 @@ python3 omnisim_seam/__init__.py --host 127.0.0.1 \
 ```
 
 Completion is recorded only when OmniSim reports `arrived=true`,
-`settled=true`, and `timed_out=false`. The HTTP budget is configurable and is
-extended for route distance plus settling; use `--timeout-s`,
-`--cruise-speed-mps`, and `--settle-timeout-s` for a particular bridge.
+`settled=true`, and `timed_out=false`. The HTTP budget is derived from
+the **observed starting pose** (configured spawn is fallback only); use
+`--timeout-s`, `--cruise-speed-mps`, and `--settle-timeout-s` for a
+particular bridge. Adapter-side notes, defensive checks, and the
+completion-gate contract: [`omnisim_seam/ADAPTER.md`](omnisim_seam/ADAPTER.md).
+
+Offline rerun (no OmniSim required):
+
+```bash
+./omnisim_seam/rerun.sh
+```
 
 ## Quick Start
 ```bash
