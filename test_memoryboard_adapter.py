@@ -228,3 +228,40 @@ def test_dock_log_is_timestamped_and_complete(stub_server):
     state = adapter.instrument_state()
     assert state["docked"] is True
     assert state["events"] == len(adapter.dock_log)
+
+
+def test_failed_attach_does_not_commit_state_when_not_offline_ok(stub_server):
+    adapter = MemoryboardAdapter(
+        base_url=stub_server, offline_ok=False, session_id="board-a",
+    )
+    before_url = adapter.base_url
+    before_session = adapter.session_id
+    log_len = len(adapter.dock_log)
+
+    with pytest.raises(MemoryboardOffline):
+        adapter.attach("http://127.0.0.1:1", reason="dead_board")
+
+    assert adapter.base_url == before_url
+    assert adapter.session_id == before_session
+    assert adapter.docked is True
+    assert adapter._instrument_url == before_url
+    assert len(adapter.dock_log) == log_len + 1
+    fail = adapter.dock_log[-1]
+    assert fail["event"] == "attach_failed"
+    assert fail["to_url"] == "http://127.0.0.1:1"
+    assert fail["note"] == "health probe failed; dock state unchanged"
+    # Subsequent I/O still hits the live board, not the dead candidate.
+    assert adapter.status() == {"schema": "continuity-ledger-v1"}
+
+
+def test_failed_attach_from_undocked_stays_undocked(stub_server):
+    adapter = MemoryboardAdapter(
+        base_url=stub_server, offline_ok=False, session_id="board-a",
+    )
+    adapter.detach(reason="unplug")
+    with pytest.raises(MemoryboardOffline):
+        adapter.attach("http://127.0.0.1:1", reason="dead")
+    assert adapter.docked is False
+    assert adapter.session_id == "board-a"
+    with pytest.raises(MemoryboardUndocked):
+        adapter.remember("x", user_requested=True)
