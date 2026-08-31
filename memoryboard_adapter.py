@@ -121,6 +121,10 @@ class MemoryboardAdapter:
             with urlopen(req, timeout=self.timeout) as resp:
                 payload = resp.read().decode("utf-8")
                 return json.loads(payload) if payload else {}
+        except json.JSONDecodeError as exc:
+            if self.offline_ok:
+                return {"_offline": True, "_error": f"invalid_json: {exc}"}
+            raise MemoryboardError(f"memoryboard returned invalid JSON: {exc}") from exc
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")
             if self.offline_ok:
@@ -232,7 +236,7 @@ class MemoryboardAdapter:
             health = self._request(
                 "GET", "/health", base_url=new_url, ignore_dock=True,
             )
-        except (MemoryboardError, MemoryboardOffline) as exc:
+        except (MemoryboardError, MemoryboardOffline, json.JSONDecodeError) as exc:
             self._stamp(
                 "attach_failed",
                 reason=reason,
