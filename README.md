@@ -30,6 +30,11 @@ The swarm can persist and recall governed memory through the Jarvis Memoryboard
 - Offline by default (`offline_ok=True`): degrades to offline markers instead of
   crashing the swarm. Set `JARVIS_MEMORYBOARD_URL` when a memoryboard is running.
 
+A successful draft write proves persistence, provenance, evidence, and its
+content hash. It does **not** by itself prove STM-to-LTM promotion or continuity
+consolidation. When the promotion decision abstains, report the result as
+"draft persisted, promotion correctly abstained."
+
 ```bash
 # Run the governed swarm + memoryboard adapter demo
 python governed_swarm_memory_demo.py
@@ -42,6 +47,23 @@ Project structure additions:
 - `memoryboard_adapter.py` – Jarvis Memoryboard (EMR) + RAG integration adapter
 - `governed_swarm_memory_demo.py` – Governed swarm wired to the memoryboard
 - `test_memoryboard_adapter.py` – Adapter tests (stub HTTP server)
+
+## OmniSim seam
+
+`omnisim_seam` is a bounded mobile-robot adapter, not a full navigation-stack
+integration. Its shipped example defaults target the OmniSim Husky world:
+`husky_ne:8865`, `husky_nw:8866`, `husky_se:8867`, and `husky_sw:8868`.
+Endpoints are configurable, for example:
+
+```bash
+python3 omnisim_seam/__init__.py --host 127.0.0.1 \
+  --robot-endpoint robot_a:8765 --robot-endpoint robot_b:8766
+```
+
+Completion is recorded only when OmniSim reports `arrived=true`,
+`settled=true`, and `timed_out=false`. The HTTP budget is configurable and is
+extended for route distance plus settling; use `--timeout-s`,
+`--cruise-speed-mps`, and `--settle-timeout-s` for a particular bridge.
 
 ## Quick Start
 ```bash

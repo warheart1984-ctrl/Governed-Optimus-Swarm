@@ -81,6 +81,23 @@ WAYPOINTS: Dict[str, Waypoint] = {
     "wp_y": Waypoint("wp_y", x=+4.0, y=+2.0),
 }
 
+# The endpoints exposed by the shipped OmniSim Husky world.  These are
+# example defaults only: deployments can replace them with --robot-endpoint.
+DEFAULT_ROBOT_PORTS: Dict[str, int] = {
+    "husky_ne": 8865,
+    "husky_nw": 8866,
+    "husky_se": 8867,
+    "husky_sw": 8868,
+}
+
+
+def default_spawn_locations(robot_ids: List[str]) -> Dict[str, Waypoint]:
+    """Give configured robots deterministic spawn metadata for the seam."""
+    return {
+        robot_id: Waypoint(f"spawn_{robot_id}", x=-4.0, y=-2.0 + 2.0 * index)
+        for index, robot_id in enumerate(robot_ids)
+    }
+
 
 # ======================================================================== #
 # 2. The ONE assignment object (envelope over the swarm's real log entry)  #
@@ -203,13 +220,18 @@ class OmniSimMobile:
     """One OmniSim mobile-robot bridge. Exposes only what the seam needs."""
 
     def __init__(self, robot_id: str, base_url: str,
-                 spawn: Waypoint, timeout_s: float = 10.0):
+                 spawn: Waypoint, waypoints: Dict[str, Waypoint] = WAYPOINTS,
+                 timeout_s: float = 45.0, cruise_speed_mps: float = 0.20,
+                 settle_timeout_s: float = 10.0):
         self.robot_id = robot_id
         self.base_url = base_url.rstrip("/")
         self.spawn = spawn
+        self.waypoints = waypoints
         self.timeout_s = timeout_s
+        self.cruise_speed_mps = cruise_speed_mps
+        self.settle_timeout_s = settle_timeout_s
 
-    def _post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _post(self, path: str, body: Dict[str, Any], timeout_s: Optional[float] = None) -> Dict[str, Any]:
         req = urllib.request.Request(
             f"{self.base_url}{path}",
             data=json.dumps(body).encode(),
@@ -217,7 +239,7 @@ class OmniSimMobile:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
+            with urllib.request.urlopen(req, timeout=timeout_s or self.timeout_s) as r:
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             return {"ok": False, "http": e.code, "body": e.read().decode()}
@@ -236,15 +258,19 @@ class OmniSimMobile:
         if assignment.policy == "hold" or not assignment.target:
             return self._post("/stop_robot", {"robot_id": self.robot_id})
 
-        wp = WAYPOINTS[assignment.target]
+        wp = self.waypoints.get(assignment.target)
+        if wp is None:
+            return {"ok": False, "error": "unknown_waypoint", "target": assignment.target}
         if assignment.policy == "abstain":
             # Evidence insufficient -> fail closed, do not move.
             return self._post("/stop_robot", {"robot_id": self.robot_id})
 
+        distance_m = ((wp.x - self.spawn.x) ** 2 + (wp.y - self.spawn.y) ** 2) ** 0.5
+        distance_timeout_s = distance_m / max(self.cruise_speed_mps, 0.01) + self.settle_timeout_s
         return self._post("/drive_to_waypoint", {
             "robot_id": self.robot_id,
             "x": wp.x, "y": wp.y, "wait": True,
-        })
+        }, timeout_s=max(self.timeout_s, distance_timeout_s))
 
     # -- observation: measured pose ----------------------------------------
     def observe(self) -> Dict[str, Any]:
@@ -285,6 +311,11 @@ class Adapter:
     ):
         self.robots = robots
         self.envelope = AssignmentEnvelope(waypoints, enabled_policy)
+        # The adapter owns the waypoint table.  This makes a custom table
+        # authoritative for both envelope resolution and mobile dispatch.
+        for robot in self.robots.values():
+            if isinstance(robot, OmniSimMobile):
+                robot.waypoints = waypoints
         self.evidence: List[EvidenceRecord] = []
 
     def run(self, swarm_log_entry: Dict[str, Any]) -> Optional[EvidenceRecord]:
@@ -323,7 +354,12 @@ class Adapter:
         dispatch = robot.dispatch(assignment)
         after = robot.observe()
 
-        ok = dispatch.get("ok") is not False and dispatch.get("error") is None
+        ok = (
+            dispatch.get("ok") is not False
+            and dispatch.get("arrived") is True
+            and dispatch.get("settled") is True
+            and dispatch.get("timed_out") is False
+        )
         outcome = "completed" if ok else "rejected"
         if dispatch.get("error") == "transport":
             outcome = "transport_error"
@@ -358,23 +394,43 @@ def main() -> None:
     import argparse
     p = argparse.ArgumentParser(description="OmniSim <-> governed-swarm seam")
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument(
+        "--robot-endpoint", action="append", metavar="ID:PORT",
+        help="Override example Husky endpoint(s); repeat as needed (e.g. robot_a:8765).",
+    )
+    p.add_argument("--timeout-s", type=float, default=45.0,
+                   help="Minimum HTTP timeout; distance and settling can extend it.")
+    p.add_argument("--cruise-speed-mps", type=float, default=0.20)
+    p.add_argument("--settle-timeout-s", type=float, default=10.0)
     p.add_argument("--out", default="omnisim_seam_evidence.json")
     p.add_argument("--headless", action="store_true",
                    help="don't require live OmniSim; emit transport_error not dispatch")
     args = p.parse_args()
 
+    robot_ports = dict(DEFAULT_ROBOT_PORTS)
+    if args.robot_endpoint:
+        robot_ports = {}
+        for raw in args.robot_endpoint:
+            robot_id, separator, raw_port = raw.partition(":")
+            if not robot_id or not separator or not raw_port.isdigit():
+                p.error(f"invalid --robot-endpoint {raw!r}; expected ID:PORT")
+            robot_ports[robot_id] = int(raw_port)
+    spawns = default_spawn_locations(list(robot_ports))
     robots = {
-        "robot_a": OmniSimMobile("robot_a", f"http://{args.host}:8765", SPAWN_LOCATIONS["robot_a"]),
-        "robot_b": OmniSimMobile("robot_b", f"http://{args.host}:8766", SPAWN_LOCATIONS["robot_b"]),
+        robot_id: OmniSimMobile(
+            robot_id, f"http://{args.host}:{port}", spawns[robot_id],
+            WAYPOINTS, args.timeout_s, args.cruise_speed_mps, args.settle_timeout_s,
+        )
+        for robot_id, port in robot_ports.items()
     }
     adapter = Adapter(robots)
 
     # Serving two real swarm log lines (the honest shape Governed-Optimus-Swarm
     # emits in governed_swarm.py / swarm_core.py).
     swarm_lines = [
-        {"robot": "robot_a", "role": "carrier", "from": [0, 0], "to": [5, 0],
+        {"robot": "husky_ne", "role": "carrier", "from": [0, 0], "to": [5, 0],
          "task_before": "idle", "task_after": "moving", "state_hash": "h1"},
-        {"robot": "robot_b", "role": "carrier", "from": [0, 1], "to": [5, 1],
+        {"robot": "husky_nw", "role": "carrier", "from": [0, 1], "to": [5, 1],
          "task_before": "idle", "task_after": "moving", "state_hash": "h2"},
     ]
 
@@ -397,8 +453,8 @@ def main() -> None:
         request_id=duplicate.request_id,
         accepted=False,
         dispatch={},
-        observation_before=robots["robot_a"].observe(),
-        observation_after=robots["robot_a"].observe(),
+        observation_before=robots["husky_ne"].observe(),
+        observation_after=robots["husky_ne"].observe(),
         outcome="rejected_duplicate",
     ))
 

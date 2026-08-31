@@ -59,7 +59,7 @@ class FakeMobile:
             return {"ok": False, "error": "transport", "message": "sim down"}
         if self.outcome == "rejected":
             return {"ok": False, "error": "busy", "message": "robot busy"}
-        return {"ok": True, "accepted": True}
+        return {"ok": True, "accepted": True, "arrived": True, "settled": True, "timed_out": False}
 
     def observe(self) -> dict:
         self.observe_calls += 1
@@ -245,6 +245,44 @@ def test_evidence_stream_records_full_attempt(adapter_factory):
     for key in ("assignment", "request_id", "dispatch",
                 "observation_before", "observation_after", "outcome"):
         assert key in rec.to_json()
+
+
+def test_completion_requires_arrived_settled_and_not_timed_out(adapter_factory):
+    ad = adapter_factory()
+    robot = ad.robots["robot_a"]
+    original_dispatch = robot.dispatch
+    robot.dispatch = lambda assignment: {"ok": True, "arrived": True, "settled": False, "timed_out": False}
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert rec.accepted is False
+    assert rec.outcome == "rejected"
+    robot.dispatch = original_dispatch
+
+
+def test_adapter_waypoint_table_controls_mobile_dispatch():
+    custom = {"custom": type(WAYPOINTS["wp_x"])("custom", 99.0, 98.0)}
+    mobile = OmniSimMobile("robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"])
+    ad = Adapter({"robot_a": mobile}, waypoints=custom)
+    assert mobile.waypoints is custom
+    assignment = Assignment("robot_a", "go_to_custom", "custom", "navigate", "req-custom")
+    captured = {}
+    mobile._post = lambda path, body, timeout_s=None: captured.update(path=path, body=body, timeout_s=timeout_s) or {}  # type: ignore[method-assign]
+    mobile.dispatch(assignment)
+    assert captured["path"] == "/drive_to_waypoint"
+    assert captured["body"]["x"] == 99.0
+    assert captured["body"]["y"] == 98.0
+
+
+def test_drive_timeout_covers_distance_and_settling():
+    mobile = OmniSimMobile(
+        "robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"],
+        {"far": type(WAYPOINTS["wp_x"])("far", 20.0, -2.0)},
+        timeout_s=5.0, cruise_speed_mps=1.0, settle_timeout_s=3.0,
+    )
+    captured = {}
+    mobile._post = lambda path, body, timeout_s=None: captured.update(timeout_s=timeout_s) or {}  # type: ignore[method-assign]
+    mobile.dispatch(Assignment("robot_a", "go_to_far", "far", "navigate", "req-far"))
+    assert captured["timeout_s"] == 27.0  # 24 m at 1 m/s, plus 3 s settling
 
 
 def test_rejected_attempt_captured_not_thrown(adapter_factory):
