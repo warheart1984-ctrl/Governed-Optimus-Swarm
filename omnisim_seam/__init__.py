@@ -46,17 +46,51 @@ Frame mapping
 -------------
   swarm grid (int, int)  ->  OmniSim world (metres, ENU, +X east +Y north)
   This adapter holds a WaypointTable: named waypoint -> (x, y) metres.
-  Robot spawn/origin also come from the table.
+  Robot spawn/origin also come from the table. The HTTP wait for a drive
+  is billed from the *observed* starting pose, not from spawn; spawn is
+  fallback only when that pose is unusable. See omnisim_seam/ADAPTER.md.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+try:
+    from omnisim_seam.route_geometry import (
+        DEFAULT_ARRIVAL_TOLERANCE_M,
+        DEFAULT_YAW_TOLERANCE_RAD,
+        heading_error_rad,
+        heading_to_goal_rad,
+        plan_route_budget,
+        pose_delta_m,
+        remaining_to_goal_m,
+        within_tolerance,
+        wrap_heading_rad,
+        xy_from_observation,
+    )
+except ImportError:  # `python3 omnisim_seam/__init__.py` (script, not package)
+    from route_geometry import (
+        DEFAULT_ARRIVAL_TOLERANCE_M,
+        DEFAULT_YAW_TOLERANCE_RAD,
+        heading_error_rad,
+        heading_to_goal_rad,
+        plan_route_budget,
+        pose_delta_m,
+        remaining_to_goal_m,
+        within_tolerance,
+        wrap_heading_rad,
+        xy_from_observation,
+    )
+
+log = logging.getLogger("omnisim_seam")
+log.addHandler(logging.NullHandler())
 
 
 # ======================================================================== #
@@ -247,13 +281,22 @@ class OmniSimMobile:
             return {"ok": False, "error": "transport", "message": str(e)}
 
     # -- dispatch: ONE command per assignment ------------------------------
-    def dispatch(self, assignment: Assignment) -> Dict[str, Any]:
+    def dispatch(self, assignment: Assignment,
+                 start_pose: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Turn ONE assignment into ONE OmniSim mobile command.
 
         Waypoint -> /drive_to_waypoint {x, y, wait}
         hold      -> /stop_robot
         abstain   -> /stop_robot (fail closed; no motion on stale/absent target)
-        Returns the raw bridge reply (measured outcome).
+
+        The HTTP wait is billed from the *observed* starting pose (OmniLink-
+        validated). Configured spawn is a fallback only when that pose is
+        unusable (NaN/Inf/missing). An implausible distance aborts before
+        any `/drive_to_waypoint` POST. Heading error is logged, not used
+        to veto: turn-control is OmniSim physics, not this adapter.
+
+        Returns the raw bridge reply (measured outcome) plus a `route`
+        budget object for the evidence stream.
         """
         if assignment.policy == "hold" or not assignment.target:
             return self._post("/stop_robot", {"robot_id": self.robot_id})
@@ -265,12 +308,44 @@ class OmniSimMobile:
             # Evidence insufficient -> fail closed, do not move.
             return self._post("/stop_robot", {"robot_id": self.robot_id})
 
-        distance_m = ((wp.x - self.spawn.x) ** 2 + (wp.y - self.spawn.y) ** 2) ** 0.5
-        distance_timeout_s = distance_m / max(self.cruise_speed_mps, 0.01) + self.settle_timeout_s
-        return self._post("/drive_to_waypoint", {
+        budget = plan_route_budget(
+            start_obs=start_pose,
+            goal_xy=(wp.x, wp.y),
+            fallback_xy=(self.spawn.x, self.spawn.y),
+            cruise_speed_mps=self.cruise_speed_mps,
+            settle_timeout_s=self.settle_timeout_s,
+            min_timeout_s=self.timeout_s,
+        )
+        log.info(
+            "route robot=%s request_id=%s source=%s distance_m=%.3f "
+            "timeout_s=%.1f spawn_drift_m=%s heading_error_rad=%s notes=%s",
+            self.robot_id, assignment.request_id, budget.source,
+            budget.distance_m, budget.timeout_s, budget.spawn_drift_m,
+            budget.heading_error_rad, list(budget.notes),
+        )
+        if budget.abort_reason:
+            log.warning(
+                "early_abort robot=%s request_id=%s reason=%s",
+                self.robot_id, assignment.request_id, budget.abort_reason,
+            )
+            return {
+                "ok": False,
+                "error": "aborted",
+                "reason": budget.abort_reason,
+                "arrived": False,
+                "settled": False,
+                "timed_out": False,
+                "route": budget.to_json(),
+            }
+
+        reply = self._post("/drive_to_waypoint", {
             "robot_id": self.robot_id,
             "x": wp.x, "y": wp.y, "wait": True,
-        }, timeout_s=max(self.timeout_s, distance_timeout_s))
+        }, timeout_s=budget.timeout_s)
+        if isinstance(reply, dict):
+            reply = dict(reply)
+            reply["route"] = budget.to_json()
+        return reply
 
     # -- observation: measured pose ----------------------------------------
     def observe(self) -> Dict[str, Any]:
@@ -284,6 +359,117 @@ class OmniSimMobile:
 # ======================================================================== #
 # 4. Terminal outcome + 5. evidence stream                                 #
 # ======================================================================== #
+def pose_snapshot(label: str, obs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Timestamped pose record for the evidence stream.
+
+    Captures wall-clock and sim time so a later reader can line this
+    snapshot up with OmniSim logs without guessing.
+    """
+    obs = obs or {}
+    raw_yaw = obs.get("yaw")
+    try:
+        yaw_f = float(raw_yaw) if raw_yaw is not None else None
+    except (TypeError, ValueError):
+        yaw_f = None
+    return {
+        "label": label,
+        "wall_time": time.time(),
+        "wall_time_iso": datetime.now(timezone.utc).isoformat(),
+        "pose": obs.get("pose"),
+        "yaw": raw_yaw,
+        "yaw_wrapped_rad": wrap_heading_rad(yaw_f) if yaw_f is not None else None,
+        "sim_time": obs.get("sim_time"),
+        "mode": obs.get("mode"),
+        "note": obs.get("note"),
+    }
+
+
+def evaluate_completion_gate(dispatch: Dict[str, Any]) -> Dict[str, Any]:
+    """Explain the arrived / settled / timed_out contract in writing.
+
+    Completion is recorded only when OmniSim reports arrived=true,
+    settled=true, and timed_out=false. Pose tolerances sit next to this
+    decision as diagnostics; they do not flip it. Turn-control failures
+    are OmniSim physics, not an adapter veto.
+    """
+    arrived = dispatch.get("arrived")
+    settled = dispatch.get("settled")
+    timed_out = dispatch.get("timed_out")
+    ok_flag = dispatch.get("ok")
+    error = dispatch.get("error")
+
+    reasons: List[str] = []
+    if error == "transport":
+        decision = "transport_error"
+        reasons.append("dispatch.error == transport")
+    elif error == "aborted":
+        decision = "aborted"
+        reasons.append(f"adapter early abort: {dispatch.get('reason')}")
+    else:
+        reasons.append(f"arrived is {arrived!r} (need True)")
+        reasons.append(f"settled is {settled!r} (need True)")
+        reasons.append(f"timed_out is {timed_out!r} (need False)")
+        reasons.append(f"ok is {ok_flag!r} (must not be False)")
+        gate_ok = (
+            ok_flag is not False
+            and arrived is True
+            and settled is True
+            and timed_out is False
+        )
+        decision = "completed" if gate_ok else "rejected"
+        if gate_ok:
+            reasons.append("all three OmniSim flags satisfied -> completed")
+        else:
+            reasons.append("OmniSim completion contract not met -> rejected")
+
+    return {
+        "arrived": arrived,
+        "settled": settled,
+        "timed_out": timed_out,
+        "ok": ok_flag,
+        "error": error,
+        "decision": decision,
+        "reasons": reasons,
+        "note": (
+            "Pose tolerances are diagnostic; they do not override this gate. "
+            "Turn-control failures belong to OmniSim physics, not the adapter."
+        ),
+    }
+
+
+def _route_evidence(
+    assignment: Assignment,
+    waypoints: Dict[str, Waypoint],
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    dispatch: Dict[str, Any],
+) -> tuple:
+    """Route-distance deltas + heading diagnostics for one attempt."""
+    route = dict(dispatch.get("route") or {})
+    wp = waypoints.get(assignment.target)
+    goal_xy = (wp.x, wp.y) if wp is not None else None
+    remaining_before = remaining_to_goal_m(before, goal_xy) if goal_xy else None
+    remaining_after = remaining_to_goal_m(after, goal_xy) if goal_xy else None
+    travelled = pose_delta_m(before, after)
+    route["remaining_before_m"] = remaining_before
+    route["remaining_after_m"] = remaining_after
+    route["travelled_m"] = travelled
+    if remaining_before is not None and remaining_after is not None:
+        # Negative delta means the robot closed distance to the goal.
+        route["route_distance_delta_m"] = remaining_after - remaining_before
+    start_xy = xy_from_observation(before)
+    if start_xy is not None and goal_xy is not None:
+        desired = heading_to_goal_rad(start_xy, goal_xy)
+        current = before.get("yaw")
+        try:
+            current_f = float(current) if current is not None else None
+        except (TypeError, ValueError):
+            current_f = None
+        route["heading_to_goal_rad"] = desired
+        route["heading_error_rad"] = heading_error_rad(current_f, desired)
+    return route, goal_xy
+
+
 @dataclass
 class EvidenceRecord:
     assignment: Dict[str, Any]
@@ -292,8 +478,11 @@ class EvidenceRecord:
     dispatch: Dict[str, Any]
     observation_before: Dict[str, Any]
     observation_after: Dict[str, Any]
-    outcome: str                      # "completed" | "rejected_duplicate" | "rejected" | "transport_error"
+    outcome: str                      # "completed" | "rejected_duplicate" | "rejected" | "transport_error" | "aborted"
     wall_time: float = field(default_factory=time.time)
+    pose_snapshots: List[Dict[str, Any]] = field(default_factory=list)
+    route: Dict[str, Any] = field(default_factory=dict)
+    completion_gate: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -337,32 +526,110 @@ class Adapter:
 
         # 5b. Reject a duplicate: same robot, same in-flight request id.
         if self.envelope.is_duplicate(assignment):
+            before = robot.observe()
+            after = robot.observe()
             rec = EvidenceRecord(
                 assignment=assignment.to_json(),
                 request_id=assignment.request_id,
                 accepted=False,
                 dispatch={},
-                observation_before=robot.observe(),
-                observation_after=robot.observe(),
+                observation_before=before,
+                observation_after=after,
                 outcome="rejected_duplicate",
+                pose_snapshots=[
+                    pose_snapshot("before_duplicate", before),
+                    pose_snapshot("after_duplicate", after),
+                ],
+                completion_gate={
+                    "decision": "rejected_duplicate",
+                    "reasons": [
+                        "same robot + same in-flight request_id; "
+                        "no OmniSim command issued",
+                    ],
+                },
             )
             self.evidence.append(rec)
+            log.info(
+                "rejected_duplicate request_id=%s robot=%s target=%s",
+                assignment.request_id, assignment.robot_id, assignment.target,
+            )
             return rec
 
-        # 3/4. dispatch -> observe
+        # 3/4. observe start -> dispatch (billed from that pose) -> observe after
         before = robot.observe()
-        dispatch = robot.dispatch(assignment)
-        after = robot.observe()
-
-        ok = (
-            dispatch.get("ok") is not False
-            and dispatch.get("arrived") is True
-            and dispatch.get("settled") is True
-            and dispatch.get("timed_out") is False
+        before_snap = pose_snapshot("before", before)
+        log.info(
+            "pose_snapshot request_id=%s label=before pose=%s yaw=%s "
+            "yaw_wrapped_rad=%s sim_time=%s",
+            assignment.request_id, before_snap.get("pose"),
+            before_snap.get("yaw"), before_snap.get("yaw_wrapped_rad"),
+            before_snap.get("sim_time"),
         )
-        outcome = "completed" if ok else "rejected"
-        if dispatch.get("error") == "transport":
-            outcome = "transport_error"
+
+        try:
+            dispatch = robot.dispatch(assignment, start_pose=before)
+        except TypeError:
+            # Stubs that only accept the assignment (older fakes).
+            dispatch = robot.dispatch(assignment)
+        if not isinstance(dispatch, dict):
+            dispatch = {
+                "ok": False,
+                "error": "transport",
+                "message": f"non-dict dispatch: {type(dispatch).__name__}",
+            }
+
+        after = robot.observe()
+        after_snap = pose_snapshot("after", after)
+        log.info(
+            "pose_snapshot request_id=%s label=after pose=%s yaw=%s "
+            "yaw_wrapped_rad=%s sim_time=%s",
+            assignment.request_id, after_snap.get("pose"),
+            after_snap.get("yaw"), after_snap.get("yaw_wrapped_rad"),
+            after_snap.get("sim_time"),
+        )
+
+        route, _goal_xy = _route_evidence(
+            assignment, self.envelope.waypoints, before, after, dispatch,
+        )
+        gate = evaluate_completion_gate(dispatch)
+        remaining_after = route.get("remaining_after_m")
+        heading_err = route.get("heading_error_rad")
+        gate["pose_within_arrival_tolerance"] = within_tolerance(
+            remaining_after, DEFAULT_ARRIVAL_TOLERANCE_M,
+        )
+        gate["heading_within_yaw_tolerance"] = within_tolerance(
+            heading_err, DEFAULT_YAW_TOLERANCE_RAD,
+        )
+        gate["arrival_tolerance_m"] = DEFAULT_ARRIVAL_TOLERANCE_M
+        gate["yaw_tolerance_rad"] = DEFAULT_YAW_TOLERANCE_RAD
+        if (
+            gate["decision"] == "completed"
+            and gate["pose_within_arrival_tolerance"] is False
+        ):
+            gate["reasons"].append(
+                f"diagnostic: OmniSim said arrived, remaining "
+                f"{remaining_after} m exceeds "
+                f"{DEFAULT_ARRIVAL_TOLERANCE_M} m window "
+                "(physics-layer discrepancy; adapter does not override the gate)"
+            )
+
+        outcome = gate["decision"]
+        ok = outcome == "completed"
+        log.info(
+            "completion_gate request_id=%s decision=%s "
+            "remaining_before_m=%s remaining_after_m=%s "
+            "route_distance_delta_m=%s travelled_m=%s reasons=%s",
+            assignment.request_id, outcome,
+            route.get("remaining_before_m"), remaining_after,
+            route.get("route_distance_delta_m"), route.get("travelled_m"),
+            gate["reasons"],
+        )
+        if route.get("spawn_drift_m"):
+            log.info(
+                "pose_drift request_id=%s spawn_drift_m=%s travelled_m=%s",
+                assignment.request_id, route.get("spawn_drift_m"),
+                route.get("travelled_m"),
+            )
 
         rec = EvidenceRecord(
             assignment=assignment.to_json(),
@@ -372,13 +639,17 @@ class Adapter:
             observation_before=before,
             observation_after=after,
             outcome=outcome,
+            pose_snapshots=[before_snap, after_snap],
+            route=route,
+            completion_gate=gate,
         )
         self.evidence.append(rec)
 
-        # Any terminal outcome (completed OR transport_error) frees the
-        # request id, so a later genuine identical assignment is NOT a
-        # duplicate.
-        if outcome in ("completed", "transport_error"):
+        # Any terminal outcome frees the request id, so a later genuine
+        # identical assignment is NOT a duplicate. Adapter-side aborts are
+        # terminal: the pose was unusable, and retrying the same id would
+        # hide the next real attempt.
+        if outcome in ("completed", "transport_error", "aborted"):
             self.envelope.mark_terminal(assignment.robot_id, assignment.request_id)
         return rec
 
@@ -392,6 +663,10 @@ class Adapter:
 # ======================================================================== #
 def main() -> None:
     import argparse
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     p = argparse.ArgumentParser(description="OmniSim <-> governed-swarm seam")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument(

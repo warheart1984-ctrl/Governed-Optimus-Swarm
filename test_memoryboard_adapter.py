@@ -7,6 +7,7 @@ Jarvis Memoryboard. Covers:
 - remember() builds the correct governed EMR write payload
 - recall()/rag_query() hit the right endpoints
 - ingest_swarm_log() bounds the digest and refuses autonomous (non-user) writes
+- attach()/detach() hot-swap the instrument; new URL mints a new session
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from memoryboard_adapter import MemoryboardAdapter, MemoryboardOffline
+from memoryboard_adapter import MemoryboardAdapter, MemoryboardOffline, MemoryboardUndocked
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -160,3 +161,70 @@ def test_ingest_swarm_log_bounded_and_refuses_autonomous(stub_server):
     # The digest sent must be bounded (last 64) not the full 200.
     body = _StubHandler.requests[-1]["body"]["content"]
     assert body.count("\n") <= 64
+
+
+def test_detach_blocks_http_and_does_not_fabricate_recall(stub_server):
+    adapter = MemoryboardAdapter(base_url=stub_server, offline_ok=True, session_id="board-a")
+    adapter.status()
+    hits_before = len(_StubHandler.requests)
+
+    rec = adapter.detach(reason="test_undock")
+    assert rec["event"] == "undock"
+    assert rec["continuity"] == "undocked"
+    assert adapter.docked is False
+
+    out = adapter.recall("anything")
+    assert out["_undocked"] is True
+    assert out["memories"] is None  # not [] — that would look like an empty live ledger
+    assert out["conflicts"] is None
+    assert len(_StubHandler.requests) == hits_before
+
+    remember = adapter.remember("should not land", user_requested=True)
+    assert remember["_undocked"] is True
+    assert len(_StubHandler.requests) == hits_before
+
+
+def test_redock_same_url_keeps_session(stub_server):
+    adapter = MemoryboardAdapter(base_url=stub_server, offline_ok=False, session_id="board-a")
+    adapter.detach(reason="brief_unplug")
+    rec = adapter.attach(stub_server, reason="replug")
+    assert rec["continuity"] == "same_instrument"
+    assert rec["event"] == "dock"
+    assert adapter.session_id == "board-a"
+    assert adapter.docked is True
+    assert adapter.recall("x") == {"memories": [], "conflicts": []}
+
+
+def test_attach_new_url_mints_session_and_refuses_reuse(stub_server):
+    adapter = MemoryboardAdapter(base_url=stub_server, offline_ok=True, session_id="board-a")
+    rec = adapter.attach("http://127.0.0.1:9", session_id="board-a", reason="swap_boards")
+    assert rec["event"] == "swap"
+    assert rec["continuity"] == "new_instrument"
+    assert rec["rejected_session_reuse"] is True
+    assert adapter.session_id != "board-a"
+    assert adapter.session_id.startswith("governed-optimus-swarm-dock-")
+    assert rec["from_session_id"] == "board-a"
+    assert rec["to_session_id"] == adapter.session_id
+
+
+def test_undocked_hard_fail_when_not_offline_ok(stub_server):
+    adapter = MemoryboardAdapter(base_url=stub_server, offline_ok=False)
+    adapter.detach(reason="hard_undock")
+    with pytest.raises(MemoryboardUndocked):
+        adapter.remember("x", user_requested=True)
+
+
+def test_dock_log_is_timestamped_and_complete(stub_server):
+    adapter = MemoryboardAdapter(base_url=stub_server, offline_ok=True, session_id="board-a")
+    adapter.detach(reason="r1")
+    adapter.attach(stub_server, reason="r2")
+    events = [e["event"] for e in adapter.dock_log]
+    assert events[0] == "dock"  # constructed
+    assert "undock" in events
+    assert events[-1] == "dock"
+    for e in adapter.dock_log:
+        assert "wall_time_iso" in e
+        assert e["reason"]
+    state = adapter.instrument_state()
+    assert state["docked"] is True
+    assert state["events"] == len(adapter.dock_log)

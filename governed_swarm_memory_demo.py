@@ -43,12 +43,20 @@ def demo_governed_with_memory(steps: int = 15) -> dict[str, object]:
     # when no operator opts in; offline still degrades gracefully.
     ingest = adapter.ingest_swarm_log(swarm.log, user_requested=False)
 
+    # Hot-swap demo: undock (swarm would keep ticking) then re-seat the same
+    # instrument. A different URL would mint a new session_id.
+    undock = adapter.detach(reason="demo_undock")
+    redock = adapter.attach(adapter.base_url, reason="demo_redock")
+
     return {
         "steps": steps,
         "robots": [(r.id, r.task) for r in swarm.model.robots],
         "locked": swarm.locked_robots(),
         "log_len": len(swarm.log),
         "offline_summary": ingest[-1] if ingest else {},
+        "instrument": adapter.instrument_state(),
+        "last_undock": undock["event"],
+        "last_redock": redock["continuity"],
     }
 
 
