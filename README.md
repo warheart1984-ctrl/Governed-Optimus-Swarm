@@ -29,6 +29,10 @@ The swarm can persist and recall governed memory through the Jarvis Memoryboard
 - `rag_query(...)` — query the AMUL RAG knowledge base for governed facts.
 - Offline by default (`offline_ok=True`): degrades to offline markers instead of
   crashing the swarm. Set `JARVIS_MEMORYBOARD_URL` when a memoryboard is running.
+- Hot-swappable: `attach(url)` / `detach()` dock or undock the board at runtime.
+  The swarm keeps ticking. A new URL mints a new `session_id` so two ledgers
+  are never merged. Undocked recall returns `_undocked` (not an empty memory
+  list). Dock/undock events are stamped on `adapter.dock_log`.
 
 A successful draft write proves persistence, provenance, evidence, and its
 content hash. It does **not** by itself prove STM-to-LTM promotion or continuity
