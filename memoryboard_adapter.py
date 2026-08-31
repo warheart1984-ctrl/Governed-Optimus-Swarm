@@ -99,10 +99,13 @@ class MemoryboardAdapter:
         *,
         body: Optional[dict[str, Any]] = None,
         headers: Optional[dict[str, str]] = None,
+        base_url: Optional[str] = None,
+        ignore_dock: bool = False,
     ) -> dict[str, Any]:
-        if not self.docked:
+        if not ignore_dock and not self.docked:
             return self._undocked_response()
-        url = f"{self.base_url}{path}"
+        root = (base_url or self.base_url).rstrip("/")
+        url = f"{root}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = Request(
             url,
@@ -195,6 +198,11 @@ class MemoryboardAdapter:
         (re-seat of the same board). A different URL is a new instrument:
         a new session_id is minted so two ledgers are not merged. Passing
         the previous session_id for a new URL is rejected, not reused.
+
+        The candidate board is health-probed *before* URL/session/docked
+        are replaced. If ``offline_ok=False`` and that probe fails, prior
+        state is left untouched, ``attach_failed`` is stamped on
+        ``dock_log``, and the error is re-raised.
         """
         new_url = (base_url or "").strip().rstrip("/")
         if not new_url:
@@ -217,13 +225,38 @@ class MemoryboardAdapter:
             else:
                 to_session = session_id
 
+        event = "swap" if from_docked and not same_instrument else "dock"
+        try:
+            # Probe the candidate without mutating dock state. ignore_dock
+            # is required so an undocked adapter can still test the new board.
+            health = self._request(
+                "GET", "/health", base_url=new_url, ignore_dock=True,
+            )
+        except (MemoryboardError, MemoryboardOffline) as exc:
+            self._stamp(
+                "attach_failed",
+                reason=reason,
+                from_url=from_url,
+                to_url=new_url,
+                from_session_id=from_session,
+                to_session_id=to_session,
+                from_docked=from_docked,
+                continuity=continuity,
+                rejected_session_reuse=rejected_session_reuse,
+                health={"_offline": True, "_error": str(exc)},
+                note="health probe failed; dock state unchanged",
+            )
+            log.warning(
+                "memoryboard attach_failed to=%s reason=%s error=%s",
+                new_url, reason, exc,
+            )
+            raise
+
         self.base_url = new_url
         self.session_id = to_session
         self.docked = True
         self._instrument_url = new_url
 
-        health = self.status()
-        event = "swap" if from_docked and not same_instrument else "dock"
         note = (
             "new instrument: session rotated so two ledgers are not merged"
             if continuity == "new_instrument"

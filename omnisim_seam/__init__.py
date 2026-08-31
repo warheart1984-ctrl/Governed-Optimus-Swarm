@@ -437,6 +437,44 @@ def evaluate_completion_gate(dispatch: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def annotate_completion_geometry(
+    gate: Dict[str, Any],
+    dispatch: Dict[str, Any],
+    remaining_after_m: Optional[float],
+    heading_err_rad: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Stamp geometry diagnostics without overriding OmniSim flags.
+
+    OmniLink recommendation: if the bridge reports arrived/settled while
+    the measured remaining distance is outside the arrival window, keep
+    the transport flags as-is and emit explicit
+    ``completion_conflict=true`` / ``geometry_consistent=false`` so a
+    contradictory completion cannot be read as a clean one.
+    """
+    pose_ok = within_tolerance(remaining_after_m, DEFAULT_ARRIVAL_TOLERANCE_M)
+    heading_ok = within_tolerance(heading_err_rad, DEFAULT_YAW_TOLERANCE_RAD)
+    upstream_arrived_settled = (
+        dispatch.get("arrived") is True and dispatch.get("settled") is True
+    )
+    # Missing remaining distance is not a conflict — we cannot judge.
+    completion_conflict = bool(upstream_arrived_settled and pose_ok is False)
+
+    gate["pose_within_arrival_tolerance"] = pose_ok
+    gate["heading_within_yaw_tolerance"] = heading_ok
+    gate["arrival_tolerance_m"] = DEFAULT_ARRIVAL_TOLERANCE_M
+    gate["yaw_tolerance_rad"] = DEFAULT_YAW_TOLERANCE_RAD
+    gate["geometry_consistent"] = pose_ok
+    gate["completion_conflict"] = completion_conflict
+    if completion_conflict:
+        gate["reasons"].append(
+            f"completion_conflict: OmniSim arrived={dispatch.get('arrived')!r} "
+            f"settled={dispatch.get('settled')!r} but remaining "
+            f"{remaining_after_m} m exceeds {DEFAULT_ARRIVAL_TOLERANCE_M} m "
+            "(upstream flags preserved; geometry_consistent=false)"
+        )
+    return gate
+
+
 def _route_evidence(
     assignment: Assignment,
     waypoints: Dict[str, Waypoint],
@@ -483,6 +521,10 @@ class EvidenceRecord:
     pose_snapshots: List[Dict[str, Any]] = field(default_factory=list)
     route: Dict[str, Any] = field(default_factory=dict)
     completion_gate: Dict[str, Any] = field(default_factory=dict)
+    # Top-level copies so a reader scanning outcome=completed cannot miss
+    # a contradictory arrival (OmniLink evidence-model recommendation).
+    completion_conflict: bool = False
+    geometry_consistent: Optional[bool] = None
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -546,7 +588,11 @@ class Adapter:
                         "same robot + same in-flight request_id; "
                         "no OmniSim command issued",
                     ],
+                    "completion_conflict": False,
+                    "geometry_consistent": None,
                 },
+                completion_conflict=False,
+                geometry_consistent=None,
             )
             self.evidence.append(rec)
             log.info(
@@ -594,32 +640,19 @@ class Adapter:
         gate = evaluate_completion_gate(dispatch)
         remaining_after = route.get("remaining_after_m")
         heading_err = route.get("heading_error_rad")
-        gate["pose_within_arrival_tolerance"] = within_tolerance(
-            remaining_after, DEFAULT_ARRIVAL_TOLERANCE_M,
+        annotate_completion_geometry(
+            gate, dispatch, remaining_after, heading_err,
         )
-        gate["heading_within_yaw_tolerance"] = within_tolerance(
-            heading_err, DEFAULT_YAW_TOLERANCE_RAD,
-        )
-        gate["arrival_tolerance_m"] = DEFAULT_ARRIVAL_TOLERANCE_M
-        gate["yaw_tolerance_rad"] = DEFAULT_YAW_TOLERANCE_RAD
-        if (
-            gate["decision"] == "completed"
-            and gate["pose_within_arrival_tolerance"] is False
-        ):
-            gate["reasons"].append(
-                f"diagnostic: OmniSim said arrived, remaining "
-                f"{remaining_after} m exceeds "
-                f"{DEFAULT_ARRIVAL_TOLERANCE_M} m window "
-                "(physics-layer discrepancy; adapter does not override the gate)"
-            )
 
         outcome = gate["decision"]
         ok = outcome == "completed"
         log.info(
             "completion_gate request_id=%s decision=%s "
+            "completion_conflict=%s geometry_consistent=%s "
             "remaining_before_m=%s remaining_after_m=%s "
             "route_distance_delta_m=%s travelled_m=%s reasons=%s",
             assignment.request_id, outcome,
+            gate.get("completion_conflict"), gate.get("geometry_consistent"),
             route.get("remaining_before_m"), remaining_after,
             route.get("route_distance_delta_m"), route.get("travelled_m"),
             gate["reasons"],
@@ -642,6 +675,8 @@ class Adapter:
             pose_snapshots=[before_snap, after_snap],
             route=route,
             completion_gate=gate,
+            completion_conflict=bool(gate.get("completion_conflict")),
+            geometry_consistent=gate.get("geometry_consistent"),
         )
         self.evidence.append(rec)
 
