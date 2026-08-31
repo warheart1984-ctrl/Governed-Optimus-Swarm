@@ -82,9 +82,16 @@ Pose tolerances sit **beside** that decision:
 
 - `pose_within_arrival_tolerance` / `heading_within_yaw_tolerance` are
   recorded on `completion_gate`.
-- If OmniSim says `arrived` but remaining distance exceeds the window,
-  the evidence notes a physics-layer discrepancy and **still records
-  `completed`**. The adapter does not second-guess OmniSim.
+- If OmniSim reports `arrived` and `settled` while remaining distance
+  exceeds the window, the adapter **still records `completed`** (upstream
+  flags stay authoritative) and emits explicit
+  `completion_conflict=true` / `geometry_consistent=false` on both the
+  gate and the top-level evidence record. Downstream readers cannot
+  mistake a contradictory completion for a clean one.
+- Those two fields are the OmniLink evidence-model recommendation
+  answering the 5.1111 m / 7.0711 m class of live route miss: the last
+  live four-Husky result remains the governing result until OmniLink
+  sends a fix commit. `--live` stays off.
 - Adapter aborts (`error: aborted`) happen only *before* dispatch, when
   the start pose cannot form a sane route. They free the request id so a
   later genuine retry is not classified as a duplicate.

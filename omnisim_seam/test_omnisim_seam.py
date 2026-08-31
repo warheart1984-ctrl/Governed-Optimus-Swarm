@@ -33,6 +33,7 @@ from omnisim_seam import (
     SPAWN_LOCATIONS,
     WAYPOINTS,
     evaluate_completion_gate,
+    annotate_completion_geometry,
 )
 
 
@@ -42,10 +43,12 @@ from omnisim_seam import (
 class FakeMobile:
     """Stands in for OmniSimMobile. Proves the seam, not the simulator."""
 
-    def __init__(self, robot_id: str, pose=(0.0, 0.0), outcome="completed"):
+    def __init__(self, robot_id: str, pose=(0.0, 0.0), outcome="completed",
+                 snap_to=None):
         self.robot_id = robot_id
         self.pose = list(pose)
         self.outcome = outcome          # "completed" | "rejected" | "transport_error"
+        self.snap_to = snap_to          # optional pose after a successful dispatch
         self.dispatches: list[dict] = []
         self.observe_calls = 0
 
@@ -61,6 +64,8 @@ class FakeMobile:
             return {"ok": False, "error": "transport", "message": "sim down"}
         if self.outcome == "rejected":
             return {"ok": False, "error": "busy", "message": "robot busy"}
+        if self.snap_to is not None:
+            self.pose = list(self.snap_to)
         return {"ok": True, "accepted": True, "arrived": True, "settled": True, "timed_out": False}
 
     def observe(self) -> dict:
@@ -243,10 +248,16 @@ def test_evidence_stream_records_full_attempt(adapter_factory):
     assert rec.observation_before["pose"] == [0.0, 0.0]
     assert rec.observation_after["pose"] is not None
     assert rec.outcome == "completed"
-    # all five required fields present on the serializable record
+    # Default FakeMobile does not move: OmniSim flags say arrived, pose does
+    # not. That contradiction must be an explicit top-level field.
+    payload = rec.to_json()
+    assert payload["completion_conflict"] is True
+    assert payload["geometry_consistent"] is False
+    # all required fields present on the serializable record
     for key in ("assignment", "request_id", "dispatch",
-                "observation_before", "observation_after", "outcome"):
-        assert key in rec.to_json()
+                "observation_before", "observation_after", "outcome",
+                "completion_conflict", "geometry_consistent"):
+        assert key in payload
 
 
 def test_completion_requires_arrived_settled_and_not_timed_out(adapter_factory):
@@ -258,6 +269,8 @@ def test_completion_requires_arrived_settled_and_not_timed_out(adapter_factory):
     assert rec is not None
     assert rec.accepted is False
     assert rec.outcome == "rejected"
+    # arrived without settled is not a contradictory *completion*.
+    assert rec.completion_conflict is False
     robot.dispatch = original_dispatch
 
 
@@ -349,6 +362,42 @@ def test_evidence_records_gate_snapshots_and_route_delta(adapter_factory):
     assert "remaining_before_m" in payload["route"]
     assert "remaining_after_m" in payload["route"]
     assert "route_distance_delta_m" in payload["route"]
+    assert payload["completion_conflict"] is True
+    assert payload["geometry_consistent"] is False
+    assert payload["completion_gate"]["completion_conflict"] is True
+    assert payload["completion_gate"]["geometry_consistent"] is False
+    assert any("completion_conflict" in r for r in payload["completion_gate"]["reasons"])
+
+
+def test_clean_arrival_is_geometry_consistent():
+    """When the measured pose is on the waypoint, conflict is false."""
+    wp = WAYPOINTS["wp_x"]
+    robots = {
+        "robot_a": FakeMobile(
+            "robot_a", pose=(0.0, 0.0), snap_to=(wp.x, wp.y),
+        ),
+    }
+    ad = Adapter(robots)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert rec.outcome == "completed"
+    assert rec.completion_conflict is False
+    assert rec.geometry_consistent is True
+    assert rec.observation_after["pose"] == [wp.x, wp.y]
+
+
+def test_annotate_conflict_preserves_upstream_flags():
+    gate = evaluate_completion_gate(
+        {"ok": True, "arrived": True, "settled": True, "timed_out": False},
+    )
+    dispatch = {"ok": True, "arrived": True, "settled": True, "timed_out": False}
+    annotate_completion_geometry(gate, dispatch, remaining_after_m=5.1111)
+    assert gate["decision"] == "completed"  # upstream flags still win
+    assert gate["completion_conflict"] is True
+    assert gate["geometry_consistent"] is False
+    annotate_completion_geometry(gate, dispatch, remaining_after_m=0.05)
+    assert gate["completion_conflict"] is False
+    assert gate["geometry_consistent"] is True
 
 
 def test_rejected_attempt_captured_not_thrown(adapter_factory):
