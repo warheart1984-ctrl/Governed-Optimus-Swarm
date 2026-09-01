@@ -18,7 +18,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from memoryboard_adapter import MemoryboardAdapter, MemoryboardOffline, MemoryboardUndocked
+from memoryboard_adapter import (
+    MemoryboardAdapter,
+    MemoryboardError,
+    MemoryboardOffline,
+    MemoryboardUndocked,
+)
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -85,6 +90,19 @@ class _StubHandler(BaseHTTPRequestHandler):
     do_POST = _handle
     do_PATCH = _handle
     do_DELETE = _handle
+
+
+class _BadJsonHealthHandler(BaseHTTPRequestHandler):
+    """HTTP 200 with a body that is not JSON — attach must still audit."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b"not-json{")
 
 
 @pytest.fixture()
@@ -265,3 +283,28 @@ def test_failed_attach_from_undocked_stays_undocked(stub_server):
     assert adapter.session_id == "board-a"
     with pytest.raises(MemoryboardUndocked):
         adapter.remember("x", user_requested=True)
+
+
+def test_malformed_health_json_stamps_attach_failed(stub_server):
+    adapter = MemoryboardAdapter(
+        base_url=stub_server, offline_ok=False, session_id="board-a",
+    )
+    bad = HTTPServer(("127.0.0.1", 0), _BadJsonHealthHandler)
+    thread = threading.Thread(target=bad.serve_forever, daemon=True)
+    thread.start()
+    try:
+        bad_url = f"http://127.0.0.1:{bad.server_address[1]}"
+        before_url = adapter.base_url
+        log_len = len(adapter.dock_log)
+        with pytest.raises(MemoryboardError, match="invalid JSON"):
+            adapter.attach(bad_url, reason="garbage_health")
+        assert adapter.base_url == before_url
+        assert adapter.session_id == "board-a"
+        assert adapter.docked is True
+        assert len(adapter.dock_log) == log_len + 1
+        fail = adapter.dock_log[-1]
+        assert fail["event"] == "attach_failed"
+        assert fail["to_url"] == bad_url
+    finally:
+        bad.shutdown()
+        thread.join(timeout=2)
