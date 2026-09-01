@@ -722,6 +722,56 @@ class Adapter:
         with open(path, "w", encoding="utf-8") as f:
             json.dump([r.to_json() for r in self.evidence], f, indent=2)
 
+    def recover_robot(self, robot_id: str, reason: str = "manual_recovery") -> None:
+        """Force-recover a robot from a locked/unhealthy state.
+
+        Unconditionally clears the robot's in-flight request so subsequent
+        assignments are not falsely flagged as duplicates, and records a
+        ``rejected_duplicate``-style evidence entry with
+        ``outcome="aborted"`` so the OmniLink team has an audit trail.
+
+        Call this when your upstream system detects robot.task == "locked"
+        or a failed health check, e.g.:
+
+            if robot.task == "locked":
+                adapter.recover_robot(robot.id, "health_check_failure")
+        """
+        # Unconditionally clear any in-flight request for this robot,
+        # so the envelope no longer considers it "occupied".
+        self.envelope._open.pop(str(robot_id), None)
+
+        # Record a recovery evidence entry so the team can trace why
+        # the robot was stuck and what corrective action was taken.
+        rec = EvidenceRecord(
+            assignment={},
+            request_id=f"recover-{robot_id}",
+            accepted=False,
+            dispatch={},
+            observation_before={},
+            observation_after={},
+            outcome="aborted",
+            pose_snapshots=[],
+            route={},
+            completion_gate={
+                "decision": "aborted",
+                "reasons": [f"recovered: {reason}"],
+                "completion_conflict": False,
+                "geometry_consistent": None,
+            },
+            completion_conflict=False,
+            geometry_consistent=None,
+        )
+        self.evidence.append(rec)
+        log.info(
+            "recovered_robot robot_id=%s reason=%s evidence_recorded",
+            robot_id, reason,
+        )
+        self.evidence.append(rec)
+        log.info(
+            "recovered_robot robot_id=%s reason=%s evidence_recorded",
+            robot_id, reason,
+        )
+
 
 # ======================================================================== #
 # Demo: two robots, two waypoints, one duplicate to be rejected            #
