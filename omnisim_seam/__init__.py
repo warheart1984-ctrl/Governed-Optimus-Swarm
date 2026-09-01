@@ -525,6 +525,16 @@ class EvidenceRecord:
     # a contradictory arrival (OmniLink evidence-model recommendation).
     completion_conflict: bool = False
     geometry_consistent: Optional[bool] = None
+    # --- OmniLink geometry-attribution fields (recorded per-sample) ---
+    raw_world_root: Optional[List[float]] = None     # [obs_x, obs_y] observed start from world
+    bridge_x: Optional[float] = None                 # bridge-reported x
+    bridge_y: Optional[float] = None                 # bridge-reported y
+    bridge_yaw: Optional[float] = None               # bridge-reported yaw
+    odometry_pose: Optional[List[float]] = None      # [x, y, yaw] from odometry
+    cmd_vel_linear_x: Optional[float] = None         # last commanded linear.x
+    cmd_vel_angular_z: Optional[float] = None        # last commanded angular.z
+    world_dx_dt: Optional[float] = None              # pose-derived world vx
+    world_dy_dt: Optional[float] = None              # pose-derived world vy
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -593,6 +603,15 @@ class Adapter:
                 },
                 completion_conflict=False,
                 geometry_consistent=None,
+                raw_world_root=before.get("pose")[:2] if before.get("pose") else [None, None],
+                bridge_x=None,
+                bridge_y=None,
+                bridge_yaw=None,
+                odometry_pose=before.get("pose"),
+                cmd_vel_linear_x=None,
+                cmd_vel_angular_z=None,
+                world_dx_dt=None,
+                world_dy_dt=None,
             )
             self.evidence.append(rec)
             log.info(
@@ -677,6 +696,17 @@ class Adapter:
             completion_gate=gate,
             completion_conflict=bool(gate.get("completion_conflict")),
             geometry_consistent=gate.get("geometry_consistent"),
+            # --- OmniLink geometry-attribution fields ---
+            # observed start pose from world; may be None if observe failed
+            raw_world_root=before.get("pose", [None, None])[0:2] if before.get("pose") else [None, None],
+            bridge_x=before.get("bridge_x"),
+            bridge_y=before.get("bridge_y"),
+            bridge_yaw=before.get("bridge_yaw"),
+            odometry_pose=before.get("pose"),
+            cmd_vel_linear_x=dispatch.get("cmd_vel_linear_x"),
+            cmd_vel_angular_z=dispatch.get("cmd_vel_angular_z"),
+            world_dx_dt=dispatch.get("world_dx_dt"),
+            world_dy_dt=dispatch.get("world_dy_dt"),
         )
         self.evidence.append(rec)
 
