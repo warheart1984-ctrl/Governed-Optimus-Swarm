@@ -55,11 +55,13 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -95,6 +97,30 @@ except ImportError:  # `python3 omnisim_seam/__init__.py` (script, not package)
     from geometry_attribution import (
         AttributionLogger,
         diagnose_trace,
+    )
+
+try:
+    from control_plane import (
+        AdmissionRecord,
+        OperationLedger,
+        RunManifest,
+        admit_assignment,
+        dispatch_call_kwargs,
+        roles_from_robots,
+        verify_rebind_authorization,
+    )
+except ImportError:
+    _SEAM_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _SEAM_ROOT not in sys.path:
+        sys.path.insert(0, _SEAM_ROOT)
+    from control_plane import (
+        AdmissionRecord,
+        OperationLedger,
+        RunManifest,
+        admit_assignment,
+        dispatch_call_kwargs,
+        roles_from_robots,
+        verify_rebind_authorization,
     )
 
 log = logging.getLogger("omnisim_seam")
@@ -272,6 +298,7 @@ class OmniSimMobile:
         self.timeout_s = timeout_s
         self.cruise_speed_mps = cruise_speed_mps
         self.settle_timeout_s = settle_timeout_s
+        self._used_operation_ids: set[str] = set()
 
     def _post(self, path: str, body: Dict[str, Any], timeout_s: Optional[float] = None) -> Dict[str, Any]:
         req = urllib.request.Request(
@@ -290,7 +317,8 @@ class OmniSimMobile:
 
     # -- dispatch: ONE command per assignment ------------------------------
     def dispatch(self, assignment: Assignment,
-                 start_pose: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                 start_pose: Optional[Dict[str, Any]] = None,
+                 operation_id: Optional[str] = None) -> Dict[str, Any]:
         """Turn ONE assignment into ONE OmniSim mobile command.
 
         Waypoint -> /drive_to_waypoint {x, y, wait}
@@ -303,9 +331,24 @@ class OmniSimMobile:
         any `/drive_to_waypoint` POST. Heading error is logged, not used
         to veto: turn-control is OmniSim physics, not this adapter.
 
+        A one-use operation_id binds this physical attempt. Replay of the
+        same id is rejected with no HTTP.
+
         Returns the raw bridge reply (measured outcome) plus a `route`
         budget object for the evidence stream.
         """
+        if operation_id:
+            if operation_id in self._used_operation_ids:
+                return {
+                    "ok": False,
+                    "error": "replayed_operation",
+                    "operation_id": operation_id,
+                    "arrived": False,
+                    "settled": False,
+                    "timed_out": False,
+                }
+            self._used_operation_ids.add(operation_id)
+
         if assignment.policy == "hold" or not assignment.target:
             return self._post("/stop_robot", {"robot_id": self.robot_id})
 
@@ -539,7 +582,7 @@ class EvidenceRecord:
     dispatch: Dict[str, Any]
     observation_before: Dict[str, Any]
     observation_after: Dict[str, Any]
-    outcome: str                      # "completed" | "rejected_duplicate" | "rejected" | "transport_error" | "aborted"
+    outcome: str                      # "completed" | "rejected_duplicate" | "rejected" | "transport_error" | "aborted" | "rejected_admission" | "unverified" | "replayed_operation"
     wall_time: float = field(default_factory=time.time)
     pose_snapshots: List[Dict[str, Any]] = field(default_factory=list)
     route: Dict[str, Any] = field(default_factory=dict)
@@ -553,6 +596,8 @@ class EvidenceRecord:
     # sample stay None rather than invented zeros.
     attribution_trace: List[Dict[str, Any]] = field(default_factory=list)
     attribution_diagnosis: Dict[str, Any] = field(default_factory=dict)
+    admission: Dict[str, Any] = field(default_factory=dict)
+    operation_id: Optional[str] = None
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -567,6 +612,8 @@ class Adapter:
         robots: Dict[str, OmniSimMobile],
         waypoints: Dict[str, Waypoint] = WAYPOINTS,
         enabled_policy: str = "navigate",
+        roles: Optional[Dict[str, str]] = None,
+        verification_secret: Optional[str] = None,
     ):
         self.robots = robots
         self.envelope = AssignmentEnvelope(waypoints, enabled_policy)
@@ -576,6 +623,12 @@ class Adapter:
             if isinstance(robot, OmniSimMobile):
                 robot.waypoints = waypoints
         self.evidence: List[EvidenceRecord] = []
+        self.manifest = RunManifest.issue(
+            roles_from_robots(robots, roles),
+            verification_secret=verification_secret,
+        )
+        self.operations = OperationLedger()
+        self._last_attribution: Dict[str, tuple] = {}
 
     def recover_robot(self, robot_id: str) -> EvidenceRecord:
         """Clear this robot's in-flight envelope slot and stamp an abort.
@@ -591,6 +644,7 @@ class Adapter:
         prior_id = None if open_req is None else open_req.get("request_id")
         prior_target = "" if open_req is None else (open_req.get("target") or "")
         already_clear = open_req is None
+        prior_trace, prior_diagnosis = self._last_attribution.get(robot_id, ([], {}))
         rec = EvidenceRecord(
             assignment={
                 "robot_id": robot_id,
@@ -631,6 +685,8 @@ class Adapter:
             },
             completion_conflict=False,
             geometry_consistent=None,
+            attribution_trace=list(prior_trace),
+            attribution_diagnosis=dict(prior_diagnosis),
         )
         self.evidence.append(rec)
         log.info(
@@ -665,7 +721,169 @@ class Adapter:
             wall_time=after_snap.get("wall_time"),
         )
         diagnosis = diagnose_trace(logger.samples)
-        return logger.to_json(), diagnosis.to_json(), diagnosis.recover_recommended
+        trace = logger.to_json()
+        diagnosis_json = diagnosis.to_json()
+        self._last_attribution[robot_id] = (trace, diagnosis_json)
+        return trace, diagnosis_json, diagnosis.recover_recommended
+
+    def admit(self, assignment: Assignment):
+        """Bind the envelope assignment into a verified AdmissionRecord."""
+        return admit_assignment(assignment, self.manifest)
+
+    def rebind_role(
+        self,
+        robot_id: str,
+        new_role: str,
+        authorization: Any = None,
+    ) -> EvidenceRecord:
+        """Authorized role change: hashed ticket, new immutable manifest, receipt."""
+        ok = verify_rebind_authorization(
+            self.manifest, str(robot_id), new_role, authorization
+        )
+        if not ok or str(robot_id) not in self.manifest.roles:
+            rec = EvidenceRecord(
+                assignment={
+                    "robot_id": robot_id,
+                    "task_id": "rebind_role",
+                    "target": "",
+                    "policy": "hold",
+                    "request_id": f"rebind-{robot_id}",
+                    "new_role": new_role,
+                },
+                request_id=f"rebind-{robot_id}",
+                accepted=False,
+                dispatch={},
+                observation_before={},
+                observation_after={},
+                outcome="rebind_rejected",
+                completion_gate={
+                    "decision": "rebind_rejected",
+                    "reasons": ["unauthorized or unknown robot; manifest unchanged"],
+                    "completion_conflict": False,
+                    "geometry_consistent": None,
+                },
+                completion_conflict=False,
+                geometry_consistent=None,
+                attribution_trace=[],
+            )
+            self.evidence.append(rec)
+            log.info("rebind_rejected robot=%s new_role=%s", robot_id, new_role)
+            return rec
+        self.manifest = self.manifest.with_role(str(robot_id), new_role)
+        robot = self.robots.get(str(robot_id))
+        if robot is not None and hasattr(robot, "role"):
+            robot.role = new_role
+        rec = EvidenceRecord(
+            assignment={
+                "robot_id": robot_id,
+                "task_id": "rebind_role",
+                "target": "",
+                "policy": "hold",
+                "request_id": f"rebind-{robot_id}",
+                "new_role": new_role,
+                "generation": self.manifest.generation,
+            },
+            request_id=f"rebind-{robot_id}",
+            accepted=True,
+            dispatch={},
+            observation_before={},
+            observation_after={},
+            outcome="rebind_role",
+            completion_gate={
+                "decision": "rebind_role",
+                "reasons": [
+                    f"authorized rebind of {robot_id} -> {new_role} "
+                    f"(generation {self.manifest.generation})"
+                ],
+                "completion_conflict": False,
+                "geometry_consistent": None,
+            },
+            completion_conflict=False,
+            geometry_consistent=None,
+            attribution_trace=[],
+            admission={"role": new_role, "generation": self.manifest.generation},
+        )
+        self.evidence.append(rec)
+        log.info(
+            "rebind_role robot=%s new_role=%s generation=%s",
+            robot_id, new_role, self.manifest.generation,
+        )
+        return rec
+
+    def dispatch_with_operation_id(
+        self,
+        robot: Any,
+        assignment: Assignment,
+        start_pose: Optional[Dict[str, Any]],
+        operation_id: str,
+    ) -> Dict[str, Any]:
+        """Single-effect dispatch. Replay of operation_id never calls the robot."""
+        if self.operations.already_used(operation_id) or not self.operations.consume(operation_id):
+            return {
+                "ok": False,
+                "error": "replayed_operation",
+                "operation_id": operation_id,
+                "arrived": False,
+                "settled": False,
+                "timed_out": False,
+            }
+        kwargs = dispatch_call_kwargs(robot.dispatch, start_pose, operation_id)
+        try:
+            reply = robot.dispatch(assignment, **kwargs)
+        except TypeError as exc:
+            # Do not retry. Signature was resolved before this call.
+            return {
+                "ok": False,
+                "error": "transport",
+                "message": f"TypeError (no retry): {exc}",
+                "operation_id": operation_id,
+            }
+        if isinstance(reply, dict):
+            reply = dict(reply)
+            reply.setdefault("operation_id", operation_id)
+            return reply
+        return {
+            "ok": False,
+            "error": "transport",
+            "message": f"non-dict dispatch: {type(reply).__name__}",
+            "operation_id": operation_id,
+        }
+
+    def _reject_closed(
+        self,
+        assignment: Assignment,
+        reason: str,
+        outcome: str,
+        admission: Optional[AdmissionRecord] = None,
+        free_slot: bool = True,
+    ) -> EvidenceRecord:
+        if free_slot:
+            self.envelope.mark_terminal(assignment.robot_id, assignment.request_id)
+        rec = EvidenceRecord(
+            assignment=assignment.to_json(),
+            request_id=assignment.request_id,
+            accepted=False,
+            dispatch={},
+            observation_before={},
+            observation_after={},
+            outcome=outcome,
+            completion_gate={
+                "decision": outcome,
+                "reasons": [reason],
+                "completion_conflict": False,
+                "geometry_consistent": None,
+            },
+            completion_conflict=False,
+            geometry_consistent=None,
+            attribution_trace=[],
+            admission=admission.to_json() if admission is not None else {},
+        )
+        self.evidence.append(rec)
+        log.info(
+            "%s request_id=%s robot=%s reason=%s",
+            outcome, assignment.request_id, assignment.robot_id, reason,
+        )
+        return rec
 
     def run(self, swarm_log_entry: Dict[str, Any]) -> Optional[EvidenceRecord]:
         """Process ONE swarm log line end to end through the seam."""
@@ -684,22 +902,30 @@ class Adapter:
         }
         json.dumps(key)  # canonical/stable serializable for dedup auditing
 
+        # Bound admission BEFORE any OmniSim HTTP or motion command.
+        admission, admit_reason = self.admit(assignment)
+        if admission is None:
+            return self._reject_closed(
+                assignment,
+                admit_reason or "rejected_admission",
+                "rejected_admission",
+            )
+        if not admission.verify(self.manifest.verification_secret):
+            return self._reject_closed(
+                assignment, "admission digest mismatch", "unverified",
+                admission=admission,
+            )
+
         # 5b. Reject a duplicate: same robot, same in-flight request id.
         if self.envelope.is_duplicate(assignment):
-            before = robot.observe()
-            after = robot.observe()
             rec = EvidenceRecord(
                 assignment=assignment.to_json(),
                 request_id=assignment.request_id,
                 accepted=False,
                 dispatch={},
-                observation_before=before,
-                observation_after=after,
+                observation_before={},
+                observation_after={},
                 outcome="rejected_duplicate",
-                pose_snapshots=[
-                    pose_snapshot("before_duplicate", before),
-                    pose_snapshot("after_duplicate", after),
-                ],
                 completion_gate={
                     "decision": "rejected_duplicate",
                     "reasons": [
@@ -711,6 +937,7 @@ class Adapter:
                 },
                 completion_conflict=False,
                 geometry_consistent=None,
+                admission=admission.to_json(),
             )
             self.evidence.append(rec)
             log.info(
@@ -718,6 +945,13 @@ class Adapter:
                 assignment.request_id, assignment.robot_id, assignment.target,
             )
             return rec
+
+        # Re-verify immediately before the first side effect.
+        if not admission.verify(self.manifest.verification_secret):
+            return self._reject_closed(
+                assignment, "admission digest mismatch before dispatch",
+                "unverified", admission=admission,
+            )
 
         # 3/4. observe start -> dispatch (billed from that pose) -> observe after
         before = robot.observe()
@@ -730,16 +964,16 @@ class Adapter:
             before_snap.get("sim_time"),
         )
 
-        try:
-            dispatch = robot.dispatch(assignment, start_pose=before)
-        except TypeError:
-            # Stubs that only accept the assignment (older fakes).
-            dispatch = robot.dispatch(assignment)
+        operation_id = self.operations.mint()
+        dispatch = self.dispatch_with_operation_id(
+            robot, assignment, before, operation_id,
+        )
         if not isinstance(dispatch, dict):
             dispatch = {
                 "ok": False,
                 "error": "transport",
                 "message": f"non-dict dispatch: {type(dispatch).__name__}",
+                "operation_id": operation_id,
             }
 
         after = robot.observe()
@@ -800,6 +1034,8 @@ class Adapter:
             geometry_consistent=gate.get("geometry_consistent"),
             attribution_trace=trace,
             attribution_diagnosis=attribution_diagnosis,
+            admission=admission.to_json(),
+            operation_id=operation_id,
         )
         self.evidence.append(rec)
 

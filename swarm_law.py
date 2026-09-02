@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 from spatial_model import Robot, FloorModel, Vec2
 from specialist_registry import SpecialistRegistry
 
@@ -9,11 +9,15 @@ Every proposed action passes through law_gate() before it is committed.
 If the action violates any rule, it is rejected and the robot is locked.
 No exception, no fallback behavior — fail closed.
 
+No role (including charger) is globally exempt from R1–R7. Permissions
+come from the bound RunManifest role plus this gate. UNIVERSAL_STATES
+are task-class exemptions for R3 only, not a role bypass.
+
 Rules enforced:
   R1 — Identity anchor must not have changed.
   R2 — Robot role must exist in the specialist registry.
   R3 — Proposed task must be permitted for the robot's role
-         (universal locomotion/system states are exempt).
+         (universal locomotion/system states are exempt from R3 only).
   R4 — Proposed position must be in-bounds.
   R5 — Proposed position must not be a blocked zone.
   R6 — A locked robot may not take any action.
@@ -40,9 +44,12 @@ class SwarmLaw:
         proposed_task: str,
         model: FloorModel,
         original_anchor: str,
+        bound_role: Optional[str] = None,
     ) -> Tuple[Vec2, str]:
 
         violations = []
+        # Frozen RunManifest role wins over a mutated Robot.role field.
+        role = bound_role if bound_role is not None else robot.role
 
         # R6 — locked robots cannot act
         if robot.task == "locked":
@@ -56,13 +63,13 @@ class SwarmLaw:
             )
 
         # R2 — role must exist
-        if self.registry.get(robot.role) is None:
-            violations.append(f"R2: Role '{robot.role}' not in registry.")
+        if self.registry.get(role) is None:
+            violations.append(f"R2: Role '{role}' not in registry.")
 
-        # R3 — task must be permitted (unless universal)
-        if proposed_task not in UNIVERSAL_STATES and not self.registry.is_permitted(robot.role, proposed_task):
+        # R3 — task must be permitted (unless universal). No charger bypass.
+        if proposed_task not in UNIVERSAL_STATES and not self.registry.is_permitted(role, proposed_task):
             violations.append(
-                f"R3: Role '{robot.role}' not permitted to perform task '{proposed_task}'."
+                f"R3: Role '{role}' not permitted to perform task '{proposed_task}'."
             )
 
         # R4 — in bounds

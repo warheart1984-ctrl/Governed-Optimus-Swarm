@@ -2,7 +2,11 @@ from typing import List, Dict, Any, Optional
 import hashlib
 import json
 
-from spatial_model import FloorModel, Robot, TaskNode, Vec2
+from control_plane import (
+    RunManifest,
+    verify_rebind_authorization,
+)
+from spatial_model import DuplicateRobotIdError, FloorModel, Robot, TaskNode, Vec2
 from specialist_registry import SpecialistRegistry
 from swarm_law import SwarmLaw, LawViolation
 
@@ -20,8 +24,18 @@ class GovernedSwarm:
         self.law = SwarmLaw(registry)
         self.log: List[Dict[str, Any]] = []
 
+        ids = [r.id for r in model.robots]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicates:
+            raise DuplicateRobotIdError(
+                f"duplicate robot ids are forbidden at swarm init: {duplicates}"
+            )
+
         # Freeze identity anchors at init — any drift is a law violation.
         self._anchors: Dict[str, str] = {r.id: r.identity_anchor for r in model.robots}
+        # Freeze roles into an immutable RunManifest. Mutating Robot.role
+        # after this point does not change admitted authority.
+        self.manifest = RunManifest.issue({r.id: r.role for r in model.robots})
 
     # ------------------------------------------------------------------ #
     # Movement                                                           #
@@ -40,11 +54,11 @@ class GovernedSwarm:
     # Task assignment — deterministic, role-gated                        #
     # ------------------------------------------------------------------ #
 
-    def _nearest_viable_task(self, robot: Robot) -> Optional[TaskNode]:
+    def _nearest_viable_task(self, robot: Robot, role: str) -> Optional[TaskNode]:
         viable = [
             t for t in self.model.tasks
             if t.remaining > 0
-            and self.registry.is_permitted(robot.role, t.task_type)
+            and self.registry.is_permitted(role, t.task_type)
         ]
         if not viable:
             return None
@@ -81,8 +95,9 @@ class GovernedSwarm:
 
         old_pos = robot.pos
         old_task = robot.task
+        bound_role = self.manifest.roles.get(robot.id, robot.role)
 
-        task_node = self._nearest_viable_task(robot)
+        task_node = self._nearest_viable_task(robot, bound_role)
 
         if task_node is None:
             proposed_pos = robot.pos
@@ -101,6 +116,7 @@ class GovernedSwarm:
                 proposed_task=proposed_task,
                 model=self.model,
                 original_anchor=self._anchors[robot.id],
+                bound_role=bound_role,
             )
         except LawViolation as e:
             robot.task = "locked"
@@ -124,7 +140,7 @@ class GovernedSwarm:
 
         self.log.append({
             "robot": robot.id,
-            "role": robot.role,
+            "role": bound_role,
             "from": old_pos,
             "to": robot.pos,
             "task_before": old_task,
@@ -145,6 +161,57 @@ class GovernedSwarm:
     # ------------------------------------------------------------------ #
     # Status helpers                                                     #
     # ------------------------------------------------------------------ #
+
+    def rebind_role(
+        self,
+        robot_id: str,
+        new_role: str,
+        authorization: Any = None,
+    ) -> Dict[str, Any]:
+        """Replace the frozen role via a hashed ticket. Unauthorized = no-op."""
+        if not verify_rebind_authorization(
+            self.manifest, robot_id, new_role, authorization
+        ):
+            receipt = {
+                "event": "rebind_rejected",
+                "robot": robot_id,
+                "new_role": new_role,
+                "reason": "unauthorized",
+            }
+            self.log.append(receipt)
+            return receipt
+        if self.registry.get(new_role) is None:
+            receipt = {
+                "event": "rebind_rejected",
+                "robot": robot_id,
+                "new_role": new_role,
+                "reason": "unknown_role",
+            }
+            self.log.append(receipt)
+            return receipt
+        if robot_id not in self.manifest.roles:
+            receipt = {
+                "event": "rebind_rejected",
+                "robot": robot_id,
+                "new_role": new_role,
+                "reason": "unknown_robot",
+            }
+            self.log.append(receipt)
+            return receipt
+        self.manifest = self.manifest.with_role(robot_id, new_role)
+        for robot in self.model.robots:
+            if robot.id == robot_id:
+                robot.role = new_role
+                break
+        receipt = {
+            "event": "rebind_role",
+            "robot": robot_id,
+            "new_role": new_role,
+            "run_id": self.manifest.run_id,
+            "generation": self.manifest.generation,
+        }
+        self.log.append(receipt)
+        return receipt
 
     def locked_robots(self) -> List[str]:
         return [r.id for r in self.model.robots if r.task == "locked"]

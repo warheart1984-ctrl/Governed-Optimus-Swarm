@@ -1,0 +1,14 @@
+[project]
+name = "governed-optimus-swarm"
+version = "0.1.0"
+description = "Governed Runtime Control Plane prototype for a fail-closed multi-robot swarm."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "-q"

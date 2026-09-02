@@ -31,6 +31,9 @@ python3 -m pytest \
   "${ROOT}/omnisim_seam/test_omnisim_seam.py" \
   "${ROOT}/omnisim_seam/test_omnisim_narrow.py" \
   "${ROOT}/omnisim_seam/test_geometry_attribution.py" \
+  "${ROOT}/omnisim_seam/test_control_plane.py" \
+  "${ROOT}/test_memoryboard_adapter.py" \
+  "${ROOT}/test_swarm_law.py" \
   -q
 
 if [[ "${1:-}" == "--live" ]]; then

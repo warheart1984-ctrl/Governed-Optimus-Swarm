@@ -2,11 +2,15 @@
 
 A governed multi-robot swarm simulation framework featuring strict law enforcement, role-based specialization, and deterministic behavior. Includes a lightweight mining-swarm reference implementation for comparison.
 
+This repository is a **Governed Runtime Control Plane Prototype**. It is not a certified production system.
+
 ## Features
 - **GovernedSwarm**: Every robot action is validated against `SwarmLaw` (fail-closed). Violations result in immediate locking.
-- **Role Specialization**: `SpecialistRegistry` with locked roles (`assembler`, `carrier`, `inspector`, `charger`).
+- **Role Specialization**: `SpecialistRegistry` with locked roles (`assembler`, `carrier`, `inspector`, `charger`). Roles are frozen in an immutable `RunManifest` at startup; mutating `Robot.role` does not change admitted authority.
 - **Deterministic Task Assignment**: Manhattan-distance nearest viable task with per-tick claim management.
 - **Identity Anchoring & Auditing**: Cryptographic snapshot hashing and immutable identity anchors.
+- **AdmissionRecord**: Adapter assignments are bound and HMAC-verified before any OmniSim HTTP or motion command (prototype verification, not PKI).
+- **One-use operation_id**: Each physical dispatch is bound to a UUID4; replay is rejected with no HTTP.
 - **Mining Swarm Baseline**: Simple, ungoverned drone mining system for contrast.
 
 ## Project Structure
@@ -14,6 +18,7 @@ A governed multi-robot swarm simulation framework featuring strict law enforceme
 - `specialist_registry.py` – Role registration and permission system
 - `swarm_law.py` – ARIS-style authority gate (Rules R1–R7)
 - `governed_swarm.py` – Governed swarm orchestrator
+- `control_plane.py` – RunManifest, AdmissionRecord, operation ledger (prototype)
 - `swarm_core.py` – Lightweight mining swarm reference
 - `mining_scenario.py` – Example instantiation of the mining swarm
 
@@ -45,7 +50,18 @@ python governed_swarm_memory_demo.py
 
 # Run adapter tests (no live memoryboard required — uses a local stub server)
 python -m pytest test_memoryboard_adapter.py -q
+
+# Full offline suite (also run by GitHub Actions CI)
+python -m pytest omnisim_seam/test_omnisim_seam.py \
+  omnisim_seam/test_omnisim_narrow.py \
+  omnisim_seam/test_route_geometry.py \
+  omnisim_seam/test_geometry_attribution.py \
+  omnisim_seam/test_control_plane.py \
+  test_memoryboard_adapter.py \
+  test_swarm_law.py
 ```
+
+Install pinned pytest from `requirements.txt` (`pytest==8.3.5`). GitHub Actions runs this suite on pull requests and on pushes to `main` and `adapter-pose-route-distance`. Branch protection for the required CI check must be enabled in GitHub repository settings (it cannot be set from these files).
 
 Project structure additions:
 - `memoryboard_adapter.py` – Jarvis Memoryboard (EMR) + RAG integration adapter

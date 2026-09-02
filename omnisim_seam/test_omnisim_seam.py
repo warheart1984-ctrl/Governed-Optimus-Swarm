@@ -52,12 +52,13 @@ class FakeMobile:
         self.dispatches: list[dict] = []
         self.observe_calls = 0
 
-    def dispatch(self, assignment: Assignment, start_pose=None) -> dict:
+    def dispatch(self, assignment: Assignment, start_pose=None, operation_id=None) -> dict:
         record = {
             "robot_id": assignment.robot_id,
             "policy": assignment.policy,
             "target": assignment.target,
             "start_pose": start_pose,
+            "operation_id": operation_id,
         }
         self.dispatches.append(record)
         if self.outcome == "transport_error":

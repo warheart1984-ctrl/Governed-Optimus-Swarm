@@ -209,10 +209,12 @@ def test_recover_robot_frees_in_flight_request():
     assert recovered.outcome == "aborted"
     assert recovered.request_id == "recover-robot_a"
     assert ad.envelope._open.get("robot_a") is None
+    assert "attribution_trace" in recovered.to_json()
     # Already-clear must not crash; stamps another recover row.
     again = ad.recover_robot("robot_a")
     assert again.outcome == "aborted"
     assert again.request_id == "recover-robot_a"
+    assert "attribution_trace" in again.to_json()
 
 
 class _DoubleFrameFake:

@@ -6,6 +6,34 @@ owns. The physical Husky miss was a turn-control failure on their path;
 we are not rerunning against that known-failing path, and we are not
 patching their physics layer.
 
+This is a **Governed Runtime Control Plane Prototype**, not a certified
+production system. `--live` stays off. This work does not fix OmniSim
+Husky turn-control.
+
+## Governed admission (prototype, not PKI)
+
+The adapter no longer dispatches from an unbound raw swarm dict as the
+sole authority. `Adapter.run` is: envelope assignment → `admit()` →
+dispatch only if admitted.
+
+`AdmissionRecord` is a bound dataclass (robot_id, task_id, target, policy,
+request_id, source_log, state_hash, role, admission_id, issued_at, digest).
+The digest is HMAC-SHA256 over canonical JSON plus a run-scoped secret
+from `RunManifest`. Missing or mismatched `state_hash` / digest rejects
+on the negative path (`rejected_admission` / `unverified`) with **no**
+motion command. FakeMobile tests compute this locally. That is prototype
+independent verification, not a public-key infrastructure.
+
+Each physical attempt is bound to a one-use `operation_id` (UUID4). The
+dispatch signature is resolved with `inspect.signature` *before* the first
+call. There is no `except TypeError: dispatch(...)` retry. Replay of the
+same id is rejected with no HTTP.
+
+Robot roles are frozen in an immutable `RunManifest` at adapter/swarm
+startup. `robot.role = ...` after init does not change admitted authority.
+An authorized `rebind_role(..., authorization=ticket)` verifies a hashed
+ticket, installs a new immutable manifest copy, and logs a receipt.
+
 ## What changed
 
 1. **Route distance is billed from the observed starting pose.**
