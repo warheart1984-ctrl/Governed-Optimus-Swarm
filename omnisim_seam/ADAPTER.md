@@ -41,6 +41,18 @@ patching their physics layer.
    is opt-in (`--live`) and should stay unused until OmniLink signs off
    on the physics fix.
 
+5. **Geometry-attribution logger (waiting on OmniLink).** Each attempt
+   records a synchronized `attribution_trace` of timestamped samples
+   (raw world root, bridge x/y/yaw, odometry pose, commanded body
+   `linear.x` / `angular.z`, pose-derived world `dx/dt` `dy/dt`) plus a
+   pure diagnostic (`omnisim_seam/geometry_attribution.py`). Missing
+   OmniSim fields stay `None`; they are not filled with zeros. `R ≥ 1.1`
+   on a real Adapter run calls `recover_robot()` to clear the in-flight
+   envelope and stamp `aborted` / `recover-{id}`. This does **not** fix
+   Husky turn-control. The last live four-Husky result (5.1111 m and
+   7.0711 m misses) remains governing. `--live` stays off until OmniLink
+   sends a physics fix commit.
+
 ## Why
 
 The previous wait was `hypot(waypoint − spawn)`. Spawn is a table entry,
@@ -66,9 +78,14 @@ path-following accuracy.
   single opaque `rejected`.
 - Pose drift and remaining-distance delta make a later live run
   comparable to this one without reconstructing the geometry by hand.
+- When OmniSim (or a future logger tick) supplies odom / cmd_vel /
+  world-root on each sample, `diagnose_trace()` reports R and a
+  classification (`clean`, `double_frame`, `integration_tick_rate`)
+  without flipping the completion gate.
 
 The adapter still does not estimate slip, curvature, or turn rate. Those
-stay on the OmniSim side of the seam.
+stay on the OmniSim side of the seam. This attribution logger does not
+change that, and it is not a green light to rerun `--live`.
 
 ## How it interacts with the completion gate
 

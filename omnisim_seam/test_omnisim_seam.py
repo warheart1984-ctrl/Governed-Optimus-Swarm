@@ -256,8 +256,10 @@ def test_evidence_stream_records_full_attempt(adapter_factory):
     # all required fields present on the serializable record
     for key in ("assignment", "request_id", "dispatch",
                 "observation_before", "observation_after", "outcome",
-                "completion_conflict", "geometry_consistent"):
+                "completion_conflict", "geometry_consistent",
+                "attribution_trace", "attribution_diagnosis"):
         assert key in payload
+    assert isinstance(payload["attribution_trace"], list)
 
 
 def test_completion_requires_arrived_settled_and_not_timed_out(adapter_factory):
