@@ -553,6 +553,16 @@ class EvidenceRecord:
     # sample stay None rather than invented zeros.
     attribution_trace: List[Dict[str, Any]] = field(default_factory=list)
     attribution_diagnosis: Dict[str, Any] = field(default_factory=dict)
+    # --- OmniLink geometry-attribution fields (recorded per-sample) ---
+    raw_world_root: Optional[List[float]] = None     # [obs_x, obs_y] observed start from world
+    bridge_x: Optional[float] = None                 # bridge-reported x
+    bridge_y: Optional[float] = None                 # bridge-reported y
+    bridge_yaw: Optional[float] = None               # bridge-reported yaw
+    odometry_pose: Optional[List[float]] = None      # [x, y, yaw] from odometry
+    cmd_vel_linear_x: Optional[float] = None         # last commanded linear.x
+    cmd_vel_angular_z: Optional[float] = None        # last commanded angular.z
+    world_dx_dt: Optional[float] = None              # pose-derived world vx
+    world_dy_dt: Optional[float] = None              # pose-derived world vy
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -711,6 +721,15 @@ class Adapter:
                 },
                 completion_conflict=False,
                 geometry_consistent=None,
+                raw_world_root=before.get("pose")[:2] if before.get("pose") else [None, None],
+                bridge_x=None,
+                bridge_y=None,
+                bridge_yaw=None,
+                odometry_pose=before.get("pose"),
+                cmd_vel_linear_x=None,
+                cmd_vel_angular_z=None,
+                world_dx_dt=None,
+                world_dy_dt=None,
             )
             self.evidence.append(rec)
             log.info(
@@ -798,8 +817,17 @@ class Adapter:
             completion_gate=gate,
             completion_conflict=bool(gate.get("completion_conflict")),
             geometry_consistent=gate.get("geometry_consistent"),
-            attribution_trace=trace,
-            attribution_diagnosis=attribution_diagnosis,
+            # --- OmniLink geometry-attribution fields ---
+            # observed start pose from world; may be None if observe failed
+            raw_world_root=before.get("pose", [None, None])[0:2] if before.get("pose") else [None, None],
+            bridge_x=before.get("bridge_x"),
+            bridge_y=before.get("bridge_y"),
+            bridge_yaw=before.get("bridge_yaw"),
+            odometry_pose=before.get("pose"),
+            cmd_vel_linear_x=dispatch.get("cmd_vel_linear_x"),
+            cmd_vel_angular_z=dispatch.get("cmd_vel_angular_z"),
+            world_dx_dt=dispatch.get("world_dx_dt"),
+            world_dy_dt=dispatch.get("world_dy_dt"),
         )
         self.evidence.append(rec)
 
@@ -825,6 +853,56 @@ class Adapter:
     def export_evidence(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump([r.to_json() for r in self.evidence], f, indent=2)
+
+    def recover_robot(self, robot_id: str, reason: str = "manual_recovery") -> None:
+        """Force-recover a robot from a locked/unhealthy state.
+
+        Unconditionally clears the robot's in-flight request so subsequent
+        assignments are not falsely flagged as duplicates, and records a
+        ``rejected_duplicate``-style evidence entry with
+        ``outcome="aborted"`` so the OmniLink team has an audit trail.
+
+        Call this when your upstream system detects robot.task == "locked"
+        or a failed health check, e.g.:
+
+            if robot.task == "locked":
+                adapter.recover_robot(robot.id, "health_check_failure")
+        """
+        # Unconditionally clear any in-flight request for this robot,
+        # so the envelope no longer considers it "occupied".
+        self.envelope._open.pop(str(robot_id), None)
+
+        # Record a recovery evidence entry so the team can trace why
+        # the robot was stuck and what corrective action was taken.
+        rec = EvidenceRecord(
+            assignment={},
+            request_id=f"recover-{robot_id}",
+            accepted=False,
+            dispatch={},
+            observation_before={},
+            observation_after={},
+            outcome="aborted",
+            pose_snapshots=[],
+            route={},
+            completion_gate={
+                "decision": "aborted",
+                "reasons": [f"recovered: {reason}"],
+                "completion_conflict": False,
+                "geometry_consistent": None,
+            },
+            completion_conflict=False,
+            geometry_consistent=None,
+        )
+        self.evidence.append(rec)
+        log.info(
+            "recovered_robot robot_id=%s reason=%s evidence_recorded",
+            robot_id, reason,
+        )
+        self.evidence.append(rec)
+        log.info(
+            "recovered_robot robot_id=%s reason=%s evidence_recorded",
+            robot_id, reason,
+        )
 
 
 # ======================================================================== #
