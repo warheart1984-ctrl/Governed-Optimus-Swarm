@@ -53,8 +53,10 @@ Frame mapping
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import math
 import sys
 import time
 import urllib.request
@@ -62,7 +64,7 @@ import urllib.error
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 try:
     from omnisim_seam.route_geometry import (
@@ -79,6 +81,7 @@ try:
     )
     from omnisim_seam.geometry_attribution import (
         AttributionLogger,
+        RECOVER_FAIL_STREAK_N,
         diagnose_trace,
     )
 except ImportError:  # `python3 omnisim_seam/__init__.py` (script, not package)
@@ -96,6 +99,7 @@ except ImportError:  # `python3 omnisim_seam/__init__.py` (script, not package)
     )
     from geometry_attribution import (
         AttributionLogger,
+        RECOVER_FAIL_STREAK_N,
         diagnose_trace,
     )
 
@@ -125,6 +129,117 @@ except ImportError:
 
 log = logging.getLogger("omnisim_seam")
 log.addHandler(logging.NullHandler())
+
+DRIVE_POLL_INTERVAL_S = 0.05
+DRIVE_POLL_MAX = 10000
+
+
+def _explicit_nonblocking_capability(robot: Any) -> Optional[bool]:
+    """Read capabilities() if present. None means 'not stated'."""
+    caps_fn = getattr(robot, "capabilities", None)
+    if not callable(caps_fn):
+        return None
+    try:
+        caps = caps_fn()
+    except Exception:
+        return None
+    if not isinstance(caps, dict):
+        return None
+    if "nonblocking_wait" in caps:
+        return bool(caps["nonblocking_wait"])
+    if "wait_false" in caps:
+        return bool(caps["wait_false"])
+    actions = caps.get("actions")
+    if isinstance(actions, dict):
+        drive = actions.get("drive_to_waypoint") or actions.get("navigate")
+        if isinstance(drive, dict) and "wait" in drive:
+            wait_spec = drive.get("wait")
+            if wait_spec is False:
+                return True
+            if isinstance(wait_spec, (list, tuple)) and False in wait_spec:
+                return True
+    return None
+
+
+def _dispatch_accepts_wait(robot: Any) -> bool:
+    fn = getattr(robot, "dispatch", None)
+    if fn is None:
+        return False
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "wait" in params
+
+
+def robot_supports_nonblocking_wait(robot: Any) -> bool:
+    """Detect wait=False support *before* any drive POST.
+
+    capabilities() wins when it is explicit. Otherwise inspect.signature
+    of dispatch for a ``wait`` parameter (or **kwargs). Never infers
+    support from a TypeError after a side effect, and never retries a
+    second drive.
+    """
+    sig_ok = _dispatch_accepts_wait(robot)
+    caps = _explicit_nonblocking_capability(robot)
+    if caps is False:
+        return False
+    if caps is True:
+        return sig_ok
+    return sig_ok
+
+
+def _drive_terminal(
+    dispatch: Mapping[str, Any],
+    obs: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Stop polling on completion-gate terminal, timeout, transport, or stop.
+
+    Completion is still arrived=True AND settled=True AND timed_out=False.
+    Polling does not invent those flags.
+    """
+    obs = obs or {}
+    error = dispatch.get("error")
+    if error in ("transport", "aborted", "replayed_operation"):
+        return True
+    arrived = obs.get("arrived", dispatch.get("arrived"))
+    settled = obs.get("settled", dispatch.get("settled"))
+    timed_out = obs.get("timed_out", dispatch.get("timed_out"))
+    if arrived is True and settled is True and timed_out is False:
+        return True
+    if timed_out is True:
+        return True
+    mode = obs.get("mode", dispatch.get("mode"))
+    if mode in ("stop", "stopped"):
+        return True
+    return False
+
+
+def _merge_poll_observation(
+    dispatch: Dict[str, Any],
+    obs: Mapping[str, Any],
+) -> Dict[str, Any]:
+    out = dict(dispatch)
+    for key in ("arrived", "settled", "timed_out", "ok", "mode"):
+        if key in obs and obs[key] is not None:
+            out[key] = obs[key]
+    return out
+
+
+def _poll_budget_s(dispatch: Mapping[str, Any], robot: Any) -> float:
+    route = dispatch.get("route") if isinstance(dispatch.get("route"), dict) else {}
+    raw = route.get("timeout_s") if route else None
+    if raw is None:
+        raw = getattr(robot, "timeout_s", None)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 45.0
+    if not math.isfinite(value) or value <= 0.0:
+        return 45.0
+    return value
 
 
 # ======================================================================== #
@@ -318,7 +433,8 @@ class OmniSimMobile:
     # -- dispatch: ONE command per assignment ------------------------------
     def dispatch(self, assignment: Assignment,
                  start_pose: Optional[Dict[str, Any]] = None,
-                 operation_id: Optional[str] = None) -> Dict[str, Any]:
+                 operation_id: Optional[str] = None,
+                 wait: bool = True) -> Dict[str, Any]:
         """Turn ONE assignment into ONE OmniSim mobile command.
 
         Waypoint -> /drive_to_waypoint {x, y, wait}
@@ -333,6 +449,10 @@ class OmniSimMobile:
 
         A one-use operation_id binds this physical attempt. Replay of the
         same id is rejected with no HTTP.
+
+        ``wait=False`` returns after the command is accepted so the adapter
+        can poll ``/get_robot_state``. Default ``wait=True`` is the blocking
+        path. This method does not invent 9-field telemetry.
 
         Returns the raw bridge reply (measured outcome) plus a `route`
         budget object for the evidence stream.
@@ -389,10 +509,12 @@ class OmniSimMobile:
                 "route": budget.to_json(),
             }
 
+        wait_flag = True if wait is None else bool(wait)
+        http_timeout = budget.timeout_s if wait_flag else self.timeout_s
         reply = self._post("/drive_to_waypoint", {
             "robot_id": self.robot_id,
-            "x": wp.x, "y": wp.y, "wait": True,
-        }, timeout_s=budget.timeout_s)
+            "x": wp.x, "y": wp.y, "wait": wait_flag,
+        }, timeout_s=http_timeout)
         if isinstance(reply, dict):
             reply = dict(reply)
             reply["route"] = budget.to_json()
@@ -415,6 +537,7 @@ class OmniSimMobile:
                 "odometry", "odom", "odometry_pose",
                 "cmd_vel", "v_linear", "v_angular", "linear", "angular",
                 "odom_time", "cmd_vel_time", "world_root_time",
+                "arrived", "settled", "timed_out",
             ):
                 if key in st and st[key] is not None:
                     out[key] = st[key]
@@ -614,6 +737,8 @@ class Adapter:
         enabled_policy: str = "navigate",
         roles: Optional[Dict[str, str]] = None,
         verification_secret: Optional[str] = None,
+        poll_interval_s: float = DRIVE_POLL_INTERVAL_S,
+        recover_fail_streak_n: int = RECOVER_FAIL_STREAK_N,
     ):
         self.robots = robots
         self.envelope = AssignmentEnvelope(waypoints, enabled_policy)
@@ -629,14 +754,26 @@ class Adapter:
         )
         self.operations = OperationLedger()
         self._last_attribution: Dict[str, tuple] = {}
+        try:
+            self.poll_interval_s = float(poll_interval_s)
+        except (TypeError, ValueError):
+            self.poll_interval_s = DRIVE_POLL_INTERVAL_S
+        if not math.isfinite(self.poll_interval_s) or self.poll_interval_s < 0.0:
+            self.poll_interval_s = DRIVE_POLL_INTERVAL_S
+        try:
+            n = int(recover_fail_streak_n)
+        except (TypeError, ValueError):
+            n = RECOVER_FAIL_STREAK_N
+        self.recover_fail_streak_n = n if n >= 1 else 1
 
     def recover_robot(self, robot_id: str) -> EvidenceRecord:
         """Clear this robot's in-flight envelope slot and stamp an abort.
 
-        Used when attribution R >= 1.1 on a real Adapter run: the kinematics
-        envelope should not stay open. Safe if the slot is already empty —
-        we still record recover-{id} so the attempt is auditable. This does
-        not talk to OmniSim and does not claim to fix turn-control.
+        Used when attribution hysteresis warrants recover: consecutive
+        complete, time-aligned failing samples (default N=3, R ≥ 1.1).
+        Safe if the slot is already empty — we still record recover-{id}
+        so the attempt is auditable. This does not talk to OmniSim and
+        does not claim to fix turn-control.
         """
         robot_id = str(robot_id)
         open_req = self.envelope._open.pop(robot_id, None)
@@ -695,36 +832,111 @@ class Adapter:
         )
         return rec
 
-    def _record_attribution(
+    def _finish_attribution(
         self,
         robot_id: str,
-        before: Dict[str, Any],
-        after: Dict[str, Any],
-        dispatch: Dict[str, Any],
-        before_snap: Dict[str, Any],
-        after_snap: Dict[str, Any],
+        logger: AttributionLogger,
     ) -> tuple:
-        """Build the synchronized trace OmniLink asked for from this attempt.
-
-        Two observe() snapshots is what a blocking /drive_to_waypoint wait
-        actually gives us. Mid-drive ticks are not invented. cmd_vel / odom /
-        world-root stay None unless observe() or dispatch carried them.
-        """
-        logger = AttributionLogger(robot_id=robot_id)
-        logger.record(
-            before,
-            wall_time=before_snap.get("wall_time"),
+        """Diagnose the logger's samples. Missing fields stay None."""
+        diagnosis = diagnose_trace(
+            logger.samples,
+            recover_fail_streak_n=self.recover_fail_streak_n,
         )
-        logger.record(
-            after,
-            dispatch=dispatch,
-            wall_time=after_snap.get("wall_time"),
-        )
-        diagnosis = diagnose_trace(logger.samples)
         trace = logger.to_json()
         diagnosis_json = diagnosis.to_json()
         self._last_attribution[robot_id] = (trace, diagnosis_json)
         return trace, diagnosis_json, diagnosis.recover_recommended
+
+    def _drive_and_record(
+        self,
+        robot: Any,
+        assignment: Assignment,
+        before: Dict[str, Any],
+        before_snap: Dict[str, Any],
+        operation_id: str,
+    ) -> tuple:
+        """One dispatch, then poll or a single after-snapshot.
+
+        Nonblocking: ``wait=False`` (detected *before* this call's drive
+        POST) then poll observe() until terminal / budget / stop. Each
+        poll appends ``AttributionLogger.record``. Blocking-only stubs:
+        one dispatch, before/after only. Never TypeError-retry a second
+        drive. Completion is still arrived+settled and not timed_out.
+        """
+        logger = AttributionLogger(robot_id=assignment.robot_id)
+        navigating = assignment.policy == "navigate" and bool(assignment.target)
+        nonblocking = navigating and robot_supports_nonblocking_wait(robot)
+        wait = False if nonblocking else None
+        dispatch = self.dispatch_with_operation_id(
+            robot, assignment, before, operation_id, wait=wait,
+        )
+        if not isinstance(dispatch, dict):
+            dispatch = {
+                "ok": False,
+                "error": "transport",
+                "message": f"non-dict dispatch: {type(dispatch).__name__}",
+                "operation_id": operation_id,
+            }
+
+        logger.record(before, wall_time=before_snap.get("wall_time"))
+        snapshots = [before_snap]
+
+        poll = nonblocking and not _drive_terminal(dispatch, before)
+        if poll:
+            budget_s = _poll_budget_s(dispatch, robot)
+            deadline = time.monotonic() + budget_s
+            interval = self.poll_interval_s
+            after = before
+            after_snap = before_snap
+            polls = 0
+            while (
+                not _drive_terminal(dispatch, after)
+                and time.monotonic() < deadline
+                and polls < DRIVE_POLL_MAX
+            ):
+                if interval and interval > 0.0:
+                    time.sleep(interval)
+                after = robot.observe()
+                after_snap = pose_snapshot("mid", after)
+                snapshots.append(after_snap)
+                logger.record(
+                    after,
+                    dispatch=dispatch,
+                    wall_time=after_snap.get("wall_time"),
+                )
+                dispatch = _merge_poll_observation(dispatch, after)
+                polls += 1
+            if after_snap is before_snap:
+                after = robot.observe()
+                after_snap = pose_snapshot("after", after)
+                snapshots.append(after_snap)
+                logger.record(
+                    after,
+                    dispatch=dispatch,
+                    wall_time=after_snap.get("wall_time"),
+                )
+                dispatch = _merge_poll_observation(dispatch, after)
+            else:
+                after_snap = dict(after_snap)
+                after_snap["label"] = "after"
+                snapshots[-1] = after_snap
+        else:
+            after = robot.observe()
+            after_snap = pose_snapshot("after", after)
+            snapshots.append(after_snap)
+            logger.record(
+                after,
+                dispatch=dispatch,
+                wall_time=after_snap.get("wall_time"),
+            )
+
+        trace, diagnosis_json, recover = self._finish_attribution(
+            assignment.robot_id, logger,
+        )
+        return (
+            after, after_snap, dispatch, snapshots,
+            trace, diagnosis_json, recover,
+        )
 
     def admit(self, assignment: Assignment):
         """Bind the envelope assignment into a verified AdmissionRecord."""
@@ -816,6 +1028,7 @@ class Adapter:
         assignment: Assignment,
         start_pose: Optional[Dict[str, Any]],
         operation_id: str,
+        wait: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Single-effect dispatch. Replay of operation_id never calls the robot."""
         if self.operations.already_used(operation_id) or not self.operations.consume(operation_id):
@@ -827,7 +1040,9 @@ class Adapter:
                 "settled": False,
                 "timed_out": False,
             }
-        kwargs = dispatch_call_kwargs(robot.dispatch, start_pose, operation_id)
+        kwargs = dispatch_call_kwargs(
+            robot.dispatch, start_pose, operation_id, wait=wait,
+        )
         try:
             reply = robot.dispatch(assignment, **kwargs)
         except TypeError as exc:
@@ -965,25 +1180,18 @@ class Adapter:
         )
 
         operation_id = self.operations.mint()
-        dispatch = self.dispatch_with_operation_id(
-            robot, assignment, before, operation_id,
+        after, after_snap, dispatch, snapshots, trace, attribution_diagnosis, recover = (
+            self._drive_and_record(
+                robot, assignment, before, before_snap, operation_id,
+            )
         )
-        if not isinstance(dispatch, dict):
-            dispatch = {
-                "ok": False,
-                "error": "transport",
-                "message": f"non-dict dispatch: {type(dispatch).__name__}",
-                "operation_id": operation_id,
-            }
 
-        after = robot.observe()
-        after_snap = pose_snapshot("after", after)
         log.info(
             "pose_snapshot request_id=%s label=after pose=%s yaw=%s "
-            "yaw_wrapped_rad=%s sim_time=%s",
+            "yaw_wrapped_rad=%s sim_time=%s polls=%s",
             assignment.request_id, after_snap.get("pose"),
             after_snap.get("yaw"), after_snap.get("yaw_wrapped_rad"),
-            after_snap.get("sim_time"),
+            after_snap.get("sim_time"), len(snapshots),
         )
 
         route, _goal_xy = _route_evidence(
@@ -1016,9 +1224,6 @@ class Adapter:
                 route.get("travelled_m"),
             )
 
-        trace, attribution_diagnosis, recover = self._record_attribution(
-            assignment.robot_id, before, after, dispatch, before_snap, after_snap,
-        )
         rec = EvidenceRecord(
             assignment=assignment.to_json(),
             request_id=assignment.request_id,
@@ -1027,7 +1232,7 @@ class Adapter:
             observation_before=before,
             observation_after=after,
             outcome=outcome,
-            pose_snapshots=[before_snap, after_snap],
+            pose_snapshots=snapshots,
             route=route,
             completion_gate=gate,
             completion_conflict=bool(gate.get("completion_conflict")),
@@ -1046,14 +1251,18 @@ class Adapter:
         if outcome in ("completed", "transport_error", "aborted"):
             self.envelope.mark_terminal(assignment.robot_id, assignment.request_id)
 
-        # R >= 1.1 on a real Adapter run: clear the envelope. Pure math
+        # Consecutive complete failing samples (default N=3): clear the
+        # envelope. A single R >= 1.1 sample does not recover. Pure math
         # tests never construct an Adapter, so they cannot auto-recover.
         if recover:
             log.warning(
-                "attribution_recover robot=%s request_id=%s R=%s class=%s",
+                "attribution_recover robot=%s request_id=%s R=%s class=%s "
+                "fail_streak_peak=%s n=%s",
                 assignment.robot_id, assignment.request_id,
                 attribution_diagnosis.get("r_ratio"),
                 attribution_diagnosis.get("classification"),
+                attribution_diagnosis.get("fail_streak_peak"),
+                attribution_diagnosis.get("recover_fail_streak_n"),
             )
             self.recover_robot(assignment.robot_id)
         return rec

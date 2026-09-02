@@ -41,36 +41,88 @@ from omnisim_seam import (
 # Fake OmniSim mobile bridge: no network, deterministic measured pose.      #
 # ------------------------------------------------------------------------- #
 class FakeMobile:
-    """Stands in for OmniSimMobile. Proves the seam, not the simulator."""
+    """Stands in for OmniSimMobile. Proves the seam, not the simulator.
+
+    Default is blocking-only (no wait=False / no mid-drive sequence).
+    Pass ``poll_states`` or ``in_motion`` to opt into the adapter's
+    nonblocking poll path. Adapter tests must not require live OmniSim.
+    """
 
     def __init__(self, robot_id: str, pose=(0.0, 0.0), outcome="completed",
-                 snap_to=None):
+                 snap_to=None, poll_states=None, in_motion=None):
         self.robot_id = robot_id
         self.pose = list(pose)
         self.outcome = outcome          # "completed" | "rejected" | "transport_error"
         self.snap_to = snap_to          # optional pose after a successful dispatch
+        self.poll_states = list(
+            poll_states if poll_states is not None else (in_motion or [])
+        )
         self.dispatches: list[dict] = []
         self.observe_calls = 0
+        self._driving = False
+        self._poll_i = 0
 
-    def dispatch(self, assignment: Assignment, start_pose=None, operation_id=None) -> dict:
+    def capabilities(self) -> dict:
+        # Explicit: default FakeMobile is blocking-only. Poll sequences
+        # opt into wait=False. Detected before any drive POST.
+        return {"nonblocking_wait": bool(self.poll_states)}
+
+    def dispatch(self, assignment: Assignment, start_pose=None, operation_id=None,
+                 wait=True) -> dict:
         record = {
             "robot_id": assignment.robot_id,
             "policy": assignment.policy,
             "target": assignment.target,
             "start_pose": start_pose,
             "operation_id": operation_id,
+            "wait": wait,
         }
         self.dispatches.append(record)
         if self.outcome == "transport_error":
             return {"ok": False, "error": "transport", "message": "sim down"}
         if self.outcome == "rejected":
             return {"ok": False, "error": "busy", "message": "robot busy"}
+        if wait is False and self.poll_states:
+            self._driving = True
+            self._poll_i = 0
+            return {
+                "ok": True,
+                "accepted": True,
+                "arrived": False,
+                "settled": False,
+                "timed_out": False,
+            }
         if self.snap_to is not None:
             self.pose = list(self.snap_to)
-        return {"ok": True, "accepted": True, "arrived": True, "settled": True, "timed_out": False}
+        elif self.poll_states:
+            last = self.poll_states[-1]
+            if isinstance(last, dict) and last.get("pose") is not None:
+                self.pose = list(last["pose"])
+        flags = {"ok": True, "accepted": True, "arrived": True, "settled": True, "timed_out": False}
+        if self.poll_states:
+            last = self.poll_states[-1]
+            if isinstance(last, dict):
+                for key in ("arrived", "settled", "timed_out", "ok"):
+                    if key in last:
+                        flags[key] = last[key]
+        return flags
 
     def observe(self) -> dict:
         self.observe_calls += 1
+        if self._driving and self.poll_states:
+            idx = min(self._poll_i, len(self.poll_states) - 1)
+            st = dict(self.poll_states[idx])
+            if self._poll_i < len(self.poll_states):
+                self._poll_i += 1
+            if self._poll_i >= len(self.poll_states):
+                self._driving = False
+            if st.get("pose") is not None:
+                self.pose = list(st["pose"])
+            st.setdefault("pose", list(self.pose))
+            st.setdefault("yaw", 0.0)
+            st.setdefault("sim_time", float(self._poll_i))
+            st.setdefault("mode", "idle")
+            return st
         return {"pose": list(self.pose), "yaw": 0.0, "sim_time": 1.0, "mode": "idle"}
 
 

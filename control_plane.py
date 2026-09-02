@@ -245,6 +245,7 @@ def dispatch_call_kwargs(
     dispatch_fn: Any,
     start_pose: Any,
     operation_id: Optional[str],
+    wait: Any = None,
 ) -> Dict[str, Any]:
     """Resolve the dispatch signature *before* the first call.
 
@@ -264,6 +265,8 @@ def dispatch_call_kwargs(
         kwargs["start_pose"] = start_pose
     if operation_id is not None and (accepts_var_kw or "operation_id" in names):
         kwargs["operation_id"] = operation_id
+    if wait is not None and (accepts_var_kw or "wait" in names):
+        kwargs["wait"] = wait
     return kwargs
 
 
