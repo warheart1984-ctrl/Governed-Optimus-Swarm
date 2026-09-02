@@ -123,7 +123,11 @@ class MemoryboardAdapter:
                 return json.loads(payload) if payload else {}
         except json.JSONDecodeError as exc:
             if self.offline_ok:
-                return {"_offline": True, "_error": f"invalid_json: {exc}"}
+                return {
+                    "_offline": True,
+                    "_invalid_json": True,
+                    "_error": f"invalid_json: {exc}",
+                }
             raise MemoryboardError(f"memoryboard returned invalid JSON: {exc}") from exc
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")
@@ -204,9 +208,11 @@ class MemoryboardAdapter:
         the previous session_id for a new URL is rejected, not reused.
 
         The candidate board is health-probed *before* URL/session/docked
-        are replaced. If ``offline_ok=False`` and that probe fails, prior
-        state is left untouched, ``attach_failed`` is stamped on
-        ``dock_log``, and the error is re-raised.
+        are replaced. Unreachable + ``offline_ok=True`` still commits and
+        degrades (soft offline). Malformed ``/health`` JSON is a protocol
+        failure, not a dock: prior state is left untouched and
+        ``attach_failed`` is stamped. ``offline_ok=True`` returns that
+        record; ``offline_ok=False`` re-raises ``MemoryboardError``.
         """
         new_url = (base_url or "").strip().rstrip("/")
         if not new_url:
@@ -230,14 +236,9 @@ class MemoryboardAdapter:
                 to_session = session_id
 
         event = "swap" if from_docked and not same_instrument else "dock"
-        try:
-            # Probe the candidate without mutating dock state. ignore_dock
-            # is required so an undocked adapter can still test the new board.
-            health = self._request(
-                "GET", "/health", base_url=new_url, ignore_dock=True,
-            )
-        except (MemoryboardError, MemoryboardOffline, json.JSONDecodeError) as exc:
-            self._stamp(
+
+        def record_attach_failed(health_payload: dict[str, Any], error: object) -> dict[str, Any]:
+            rec = self._stamp(
                 "attach_failed",
                 reason=reason,
                 from_url=from_url,
@@ -247,14 +248,35 @@ class MemoryboardAdapter:
                 from_docked=from_docked,
                 continuity=continuity,
                 rejected_session_reuse=rejected_session_reuse,
-                health={"_offline": True, "_error": str(exc)},
+                health=health_payload,
                 note="health probe failed; dock state unchanged",
             )
             log.warning(
                 "memoryboard attach_failed to=%s reason=%s error=%s",
-                new_url, reason, exc,
+                new_url, reason, error,
             )
+            return rec
+
+        try:
+            # Probe the candidate without mutating dock state. ignore_dock
+            # is required so an undocked adapter can still test the new board.
+            health = self._request(
+                "GET", "/health", base_url=new_url, ignore_dock=True,
+            )
+        except (MemoryboardError, MemoryboardOffline, json.JSONDecodeError) as exc:
+            record_attach_failed({"_offline": True, "_error": str(exc)}, exc)
             raise
+
+        # HTTP 200 + garbage JSON is a protocol failure, not a dock.
+        # Unreachable + offline_ok still returns a plain _offline sentinel
+        # and commits; only explicit invalid JSON is rejected here.
+        if health.get("_invalid_json") or str(health.get("_error", "")).startswith("invalid_json:"):
+            rec = record_attach_failed(health, health.get("_error") or "invalid_json")
+            if not self.offline_ok:
+                raise MemoryboardError(
+                    f"memoryboard returned invalid JSON: {health.get('_error')}"
+                )
+            return rec
 
         self.base_url = new_url
         self.session_id = to_session

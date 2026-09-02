@@ -308,3 +308,33 @@ def test_malformed_health_json_stamps_attach_failed(stub_server):
     finally:
         bad.shutdown()
         thread.join(timeout=2)
+
+
+def test_malformed_health_json_does_not_commit_when_offline_ok(stub_server):
+    adapter = MemoryboardAdapter(
+        base_url=stub_server, offline_ok=True, session_id="board-a",
+    )
+    bad = HTTPServer(("127.0.0.1", 0), _BadJsonHealthHandler)
+    thread = threading.Thread(target=bad.serve_forever, daemon=True)
+    thread.start()
+    try:
+        bad_url = f"http://127.0.0.1:{bad.server_address[1]}"
+        before_url = adapter.base_url
+        before_session = adapter.session_id
+        log_len = len(adapter.dock_log)
+        rec = adapter.attach(bad_url, reason="garbage_health")
+        assert rec["event"] == "attach_failed"
+        assert adapter.base_url == before_url
+        assert adapter.session_id == before_session
+        assert adapter.docked is True
+        assert adapter._instrument_url == before_url
+        assert len(adapter.dock_log) == log_len + 1
+        fail = adapter.dock_log[-1]
+        assert fail["event"] == "attach_failed"
+        assert fail["to_url"] == bad_url
+        assert fail["note"] == "health probe failed; dock state unchanged"
+        assert adapter.status() == {"schema": "continuity-ledger-v1"}
+        assert _StubHandler.requests[-1]["path"] == "/health"
+    finally:
+        bad.shutdown()
+        thread.join(timeout=2)

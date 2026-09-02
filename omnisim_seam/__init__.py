@@ -75,6 +75,10 @@ try:
         wrap_heading_rad,
         xy_from_observation,
     )
+    from omnisim_seam.geometry_attribution import (
+        AttributionLogger,
+        diagnose_trace,
+    )
 except ImportError:  # `python3 omnisim_seam/__init__.py` (script, not package)
     from route_geometry import (
         DEFAULT_ARRIVAL_TOLERANCE_M,
@@ -87,6 +91,10 @@ except ImportError:  # `python3 omnisim_seam/__init__.py` (script, not package)
         within_tolerance,
         wrap_heading_rad,
         xy_from_observation,
+    )
+    from geometry_attribution import (
+        AttributionLogger,
+        diagnose_trace,
     )
 
 log = logging.getLogger("omnisim_seam")
@@ -351,8 +359,23 @@ class OmniSimMobile:
     def observe(self) -> Dict[str, Any]:
         st = self._post("/get_robot_state", {"robot_id": self.robot_id})
         if "x" in st:
-            return {"pose": [st["x"], st.get("y", 0.0)], "yaw": st.get("yaw", 0.0),
-                    "sim_time": st.get("sim_time"), "mode": st.get("mode")}
+            out: Dict[str, Any] = {
+                "pose": [st["x"], st.get("y", 0.0)],
+                "yaw": st.get("yaw", 0.0),
+                "sim_time": st.get("sim_time"),
+                "mode": st.get("mode"),
+            }
+            # Pass through optional telemetry only when the bridge actually
+            # sent it. Do not invent odom / cmd_vel / world-root zeros.
+            for key in (
+                "raw_world_root", "world_root", "world_x", "world_y",
+                "odometry", "odom", "odometry_pose",
+                "cmd_vel", "v_linear", "v_angular", "linear", "angular",
+                "odom_time", "cmd_vel_time", "world_root_time",
+            ):
+                if key in st and st[key] is not None:
+                    out[key] = st[key]
+            return out
         return {"pose": None, "yaw": None, "note": st.get("error")}
 
 
@@ -525,6 +548,11 @@ class EvidenceRecord:
     # a contradictory arrival (OmniLink evidence-model recommendation).
     completion_conflict: bool = False
     geometry_consistent: Optional[bool] = None
+    # Per-tick synchronized geometry-attribution samples (OmniLink 1 Sep 2026).
+    # Empty when observe()/dispatch did not yield a trace; fields inside a
+    # sample stay None rather than invented zeros.
+    attribution_trace: List[Dict[str, Any]] = field(default_factory=list)
+    attribution_diagnosis: Dict[str, Any] = field(default_factory=dict)
     # --- OmniLink geometry-attribution fields (recorded per-sample) ---
     raw_world_root: Optional[List[float]] = None     # [obs_x, obs_y] observed start from world
     bridge_x: Optional[float] = None                 # bridge-reported x
@@ -558,6 +586,96 @@ class Adapter:
             if isinstance(robot, OmniSimMobile):
                 robot.waypoints = waypoints
         self.evidence: List[EvidenceRecord] = []
+
+    def recover_robot(self, robot_id: str) -> EvidenceRecord:
+        """Clear this robot's in-flight envelope slot and stamp an abort.
+
+        Used when attribution R >= 1.1 on a real Adapter run: the kinematics
+        envelope should not stay open. Safe if the slot is already empty —
+        we still record recover-{id} so the attempt is auditable. This does
+        not talk to OmniSim and does not claim to fix turn-control.
+        """
+        robot_id = str(robot_id)
+        open_req = self.envelope._open.pop(robot_id, None)
+        recover_id = f"recover-{robot_id}"
+        prior_id = None if open_req is None else open_req.get("request_id")
+        prior_target = "" if open_req is None else (open_req.get("target") or "")
+        already_clear = open_req is None
+        rec = EvidenceRecord(
+            assignment={
+                "robot_id": robot_id,
+                "task_id": "recover",
+                "target": prior_target,
+                "policy": "hold",
+                "request_id": recover_id,
+                "recovered_request_id": prior_id,
+            },
+            request_id=recover_id,
+            accepted=False,
+            dispatch={
+                "ok": False,
+                "error": "aborted",
+                "reason": recover_id,
+                "arrived": False,
+                "settled": False,
+                "timed_out": False,
+            },
+            observation_before={},
+            observation_after={},
+            outcome="aborted",
+            completion_gate={
+                "decision": "aborted",
+                "arrived": False,
+                "settled": False,
+                "timed_out": False,
+                "reasons": [
+                    f"recover_robot({robot_id}): envelope in-flight slot "
+                    + (
+                        f"cleared (was {prior_id})"
+                        if not already_clear
+                        else "already clear"
+                    ),
+                ],
+                "completion_conflict": False,
+                "geometry_consistent": None,
+            },
+            completion_conflict=False,
+            geometry_consistent=None,
+        )
+        self.evidence.append(rec)
+        log.info(
+            "recover_robot robot=%s request_id=%s prior=%s already_clear=%s",
+            robot_id, recover_id, prior_id, already_clear,
+        )
+        return rec
+
+    def _record_attribution(
+        self,
+        robot_id: str,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+        dispatch: Dict[str, Any],
+        before_snap: Dict[str, Any],
+        after_snap: Dict[str, Any],
+    ) -> tuple:
+        """Build the synchronized trace OmniLink asked for from this attempt.
+
+        Two observe() snapshots is what a blocking /drive_to_waypoint wait
+        actually gives us. Mid-drive ticks are not invented. cmd_vel / odom /
+        world-root stay None unless observe() or dispatch carried them.
+        """
+        logger = AttributionLogger(robot_id=robot_id)
+        logger.record(
+            before,
+            wall_time=before_snap.get("wall_time"),
+        )
+        logger.record(
+            after,
+            dispatch=dispatch,
+            wall_time=after_snap.get("wall_time"),
+        )
+        diagnosis = diagnose_trace(logger.samples)
+        return logger.to_json(), diagnosis.to_json(), diagnosis.recover_recommended
 
     def run(self, swarm_log_entry: Dict[str, Any]) -> Optional[EvidenceRecord]:
         """Process ONE swarm log line end to end through the seam."""
@@ -683,6 +801,9 @@ class Adapter:
                 route.get("travelled_m"),
             )
 
+        trace, attribution_diagnosis, recover = self._record_attribution(
+            assignment.robot_id, before, after, dispatch, before_snap, after_snap,
+        )
         rec = EvidenceRecord(
             assignment=assignment.to_json(),
             request_id=assignment.request_id,
@@ -716,6 +837,17 @@ class Adapter:
         # hide the next real attempt.
         if outcome in ("completed", "transport_error", "aborted"):
             self.envelope.mark_terminal(assignment.robot_id, assignment.request_id)
+
+        # R >= 1.1 on a real Adapter run: clear the envelope. Pure math
+        # tests never construct an Adapter, so they cannot auto-recover.
+        if recover:
+            log.warning(
+                "attribution_recover robot=%s request_id=%s R=%s class=%s",
+                assignment.robot_id, assignment.request_id,
+                attribution_diagnosis.get("r_ratio"),
+                attribution_diagnosis.get("classification"),
+            )
+            self.recover_robot(assignment.robot_id)
         return rec
 
     def export_evidence(self, path: str) -> None:

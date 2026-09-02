@@ -30,6 +30,7 @@ python3 -m pytest \
   "${ROOT}/omnisim_seam/test_route_geometry.py" \
   "${ROOT}/omnisim_seam/test_omnisim_seam.py" \
   "${ROOT}/omnisim_seam/test_omnisim_narrow.py" \
+  "${ROOT}/omnisim_seam/test_geometry_attribution.py" \
   -q
 
 if [[ "${1:-}" == "--live" ]]; then
