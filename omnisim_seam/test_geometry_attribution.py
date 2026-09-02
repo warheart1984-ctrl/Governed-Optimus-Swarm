@@ -191,6 +191,30 @@ def test_logger_derives_velocity_from_successive_poses():
     assert trace.classification is AttributionClass.CLEAN
     assert trace.ok is True
     assert trace.recover_recommended is False
+    assert trace.vector_residual_m_s is not None
+    assert math.isclose(trace.vector_residual_m_s, 0.0, abs_tol=1e-9)
+    assert trace.heading_error_rad is not None
+    assert math.isclose(trace.heading_error_rad, 0.0, abs_tol=1e-9)
+
+
+def test_logger_uses_explicit_world_velocity_from_poll_tick():
+    """A /telemetry/poll tick that already includes dx/dt is complete without a prior pose."""
+    logger = AttributionLogger(robot_id="robot_a")
+    logger.record(
+        {
+            "pose": [1.0, 0.0], "yaw": 0.0, "sim_time": 1.0,
+            "raw_world_root": [1.0, 0.0], "odometry_pose": [1.0, 0.0],
+            "cmd_vel": {"linear": 1.0, "angular": 0.0},
+            "world_dx_dt": 1.0, "world_dy_dt": 0.0,
+        },
+        wall_time=10.0,
+    )
+    assert logger.samples[0].world_dx_dt == 1.0
+    assert logger.samples[0].world_dy_dt == 0.0
+    result = diagnose_sample(logger.samples[0])
+    assert result.classification is AttributionClass.CLEAN
+    assert result.vector_residual_m_s is not None
+    assert result.heading_error_rad is not None
 
 
 def test_diagnose_trace_empty_fail_closed():
@@ -323,6 +347,22 @@ def test_residual_and_heading_error_on_complete_absent_on_incomplete():
     assert incomplete.heading_error_rad is None
 
 
+def test_diagnose_trace_stamps_residual_and_heading_alongside_r():
+    """Trace-level diagnosis copies ||Δv|| and Δθ next to R, not only per-sample."""
+    failing = _complete(world_dx_dt=1.0, world_dy_dt=1.0)
+    trace = diagnose_trace([failing])
+    payload = trace.to_json()
+    assert payload["r_ratio"] is not None
+    assert math.isclose(payload["vector_residual_m_s"], 1.0, abs_tol=1e-9)
+    assert math.isclose(payload["heading_error_rad"], math.pi / 4.0, abs_tol=1e-9)
+    empty = diagnose_trace([])
+    assert empty.vector_residual_m_s is None
+    assert empty.heading_error_rad is None
+    incomplete = diagnose_trace([AttributionSample(wall_time=1.0, source_stamps=(1.0,))])
+    assert incomplete.vector_residual_m_s is None
+    assert incomplete.heading_error_rad is None
+
+
 def test_diagnose_trace_single_failing_does_not_recover():
     incomplete = AttributionSample(wall_time=1.0, source_stamps=(1.0,))
     failing = _complete(world_dx_dt=1.0, world_dy_dt=1.0)
@@ -385,6 +425,7 @@ def test_polling_path_records_mid_drive_samples():
     assert rec.dispatch.get("timed_out") is False
     assert rec.outcome == "completed"
     assert len(fake.dispatches) == 1
+    assert fake.poll_telemetry_calls > 0
 
 
 def test_blocking_only_stub_before_after_only():
@@ -488,3 +529,139 @@ def test_adapter_recovers_after_three_consecutive_complete_failing_samples():
     assert "robot_a" not in ad.envelope._open
     assert fake.dispatches[0]["wait"] is False
     assert len(fake.dispatches) == 1
+    assert rec.attribution_diagnosis["vector_residual_m_s"] is not None
+    assert rec.attribution_diagnosis["heading_error_rad"] is not None
+
+
+class _TelemetryPollNineFieldFake:
+    """wait=False stub: poll_telemetry supplies 9 fields; observe() does not."""
+
+    def __init__(self, robot_id: str = "robot_a"):
+        self.robot_id = robot_id
+        self.dispatches: list = []
+        self.poll_calls = 0
+        self.observe_calls = 0
+        self._n = 0
+        self._frames = [
+            ([1.0, 0.0], 1.0, False, False),
+            ([2.0, 0.0], 2.0, False, False),
+            ([4.0, -2.0], 3.0, True, True),
+        ]
+
+    def capabilities(self):
+        return {"nonblocking_wait": True}
+
+    def dispatch(self, assignment, start_pose=None, operation_id=None, wait=True):
+        self.dispatches.append({"wait": wait, "operation_id": operation_id})
+        if wait is False:
+            return {
+                "ok": True, "arrived": False, "settled": False, "timed_out": False,
+            }
+        return {
+            "ok": True, "arrived": True, "settled": True, "timed_out": False,
+        }
+
+    def observe(self):
+        self.observe_calls += 1
+        if self.observe_calls == 1:
+            return {"pose": [0.0, 0.0], "yaw": 0.0, "sim_time": 0.0, "mode": "idle"}
+        pose, sim_time, arrived, settled = self._frames[
+            min(max(self._n - 1, 0), len(self._frames) - 1)
+        ]
+        return {
+            "pose": list(pose), "yaw": 0.0, "sim_time": sim_time,
+            "arrived": arrived, "settled": settled, "timed_out": False,
+            "mode": "idle" if arrived else "moving",
+        }
+
+    def poll_telemetry(self):
+        self.poll_calls += 1
+        pose, sim_time, arrived, settled = self._frames[
+            min(self._n, len(self._frames) - 1)
+        ]
+        if self._n < len(self._frames):
+            self._n += 1
+        return {
+            "pose": list(pose),
+            "yaw": 0.0,
+            "sim_time": sim_time,
+            "raw_world_root": list(pose),
+            "odometry_pose": list(pose),
+            "cmd_vel": {"linear": {"x": 1.0}, "angular": {"z": 0.0}},
+            "world_dx_dt": 1.0,
+            "world_dy_dt": 0.0,
+            "arrived": arrived,
+            "settled": settled,
+            "timed_out": False,
+            "mode": "idle" if arrived else "moving",
+        }
+
+
+def test_telemetry_poll_mid_drive_supplies_nine_fields_not_incomplete():
+    fake = _TelemetryPollNineFieldFake()
+    ad = Adapter({"robot_a": fake}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert fake.poll_calls >= 1
+    assert fake.dispatches[0]["wait"] is False
+    assert len(fake.dispatches) == 1
+    classes = [s["classification"] for s in rec.attribution_diagnosis["samples"]]
+    assert "sample_incomplete" in classes  # before observe has no 9 fields
+    assert "clean" in classes  # mid-drive /telemetry/poll ticks do
+    assert rec.attribution_diagnosis["vector_residual_m_s"] is not None
+    assert rec.attribution_diagnosis["heading_error_rad"] is not None
+    assert rec.dispatch.get("arrived") is True
+    assert rec.dispatch.get("settled") is True
+    assert rec.dispatch.get("timed_out") is False
+    assert rec.outcome == "completed"
+
+
+class _Poll404ThenObserveFake:
+    """poll_telemetry is unusable; Adapter must fall back to observe()."""
+
+    def __init__(self, robot_id: str = "robot_a"):
+        self.robot_id = robot_id
+        self.dispatches: list = []
+        self.poll_calls = 0
+        self._n = 0
+        self._frames = [
+            {"pose": [0.0, 0.0], "yaw": 0.0, "sim_time": 0.0,
+             "arrived": False, "settled": False, "timed_out": False, "mode": "idle"},
+            {"pose": [1.0, 0.0], "yaw": 0.0, "sim_time": 1.0,
+             "arrived": False, "settled": False, "timed_out": False, "mode": "moving"},
+            {"pose": [4.0, -2.0], "yaw": 0.0, "sim_time": 2.0,
+             "arrived": True, "settled": True, "timed_out": False, "mode": "idle"},
+        ]
+
+    def capabilities(self):
+        return {"nonblocking_wait": True}
+
+    def dispatch(self, assignment, start_pose=None, operation_id=None, wait=True):
+        self.dispatches.append({"wait": wait})
+        if wait is False:
+            return {
+                "ok": True, "arrived": False, "settled": False, "timed_out": False,
+            }
+        return {"ok": True, "arrived": True, "settled": True, "timed_out": False}
+
+    def poll_telemetry(self):
+        self.poll_calls += 1
+        return {"ok": False, "http": 404, "body": "no such route"}
+
+    def observe(self):
+        st = dict(self._frames[min(self._n, len(self._frames) - 1)])
+        if self._n < len(self._frames):
+            self._n += 1
+        return st
+
+
+def test_telemetry_poll_404_falls_back_to_observe():
+    fake = _Poll404ThenObserveFake()
+    ad = Adapter({"robot_a": fake}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert fake.poll_calls >= 1
+    assert rec.dispatch.get("arrived") is True
+    assert rec.dispatch.get("settled") is True
+    assert rec.outcome == "completed"
+    assert len(rec.attribution_trace) > 2

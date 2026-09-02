@@ -132,6 +132,19 @@ log.addHandler(logging.NullHandler())
 
 DRIVE_POLL_INTERVAL_S = 0.05
 DRIVE_POLL_MAX = 10000
+TELEMETRY_POLL_PATH = "/telemetry/poll"
+GET_ROBOT_STATE_PATH = "/get_robot_state"
+
+# Optional keys passed through from /telemetry/poll or /get_robot_state.
+# Absent keys stay absent — this list never invents zeros.
+_TELEMETRY_PASSTHROUGH_KEYS = (
+    "raw_world_root", "world_root", "world_x", "world_y",
+    "odometry", "odom", "odometry_pose",
+    "cmd_vel", "v_linear", "v_angular", "linear", "angular",
+    "odom_time", "cmd_vel_time", "world_root_time",
+    "world_dx_dt", "world_dy_dt",
+    "arrived", "settled", "timed_out",
+)
 
 
 def _explicit_nonblocking_capability(robot: Any) -> Optional[bool]:
@@ -226,6 +239,32 @@ def _merge_poll_observation(
         if key in obs and obs[key] is not None:
             out[key] = obs[key]
     return out
+
+
+def _observation_has_pose(obs: Any) -> bool:
+    """True when a poll/observe reply has a usable pose (not a 404 stub)."""
+    if not isinstance(obs, dict):
+        return False
+    if obs.get("http") in (404, 405, 501):
+        return False
+    pose = obs.get("pose")
+    if pose is not None:
+        return True
+    return obs.get("x") is not None
+
+
+def _mid_drive_observation(robot: Any) -> Dict[str, Any]:
+    """Prefer ``poll_telemetry()`` (POST /telemetry/poll) during motion.
+
+    Falls back to ``observe()`` (/get_robot_state) when the named poll
+    method is absent or the reply has no pose. Does not invent fields.
+    """
+    poll_fn = getattr(robot, "poll_telemetry", None)
+    if callable(poll_fn):
+        st = poll_fn()
+        if _observation_has_pose(st):
+            return st
+    return robot.observe()
 
 
 def _poll_budget_s(dispatch: Mapping[str, Any], robot: Any) -> float:
@@ -451,8 +490,9 @@ class OmniSimMobile:
         same id is rejected with no HTTP.
 
         ``wait=False`` returns after the command is accepted so the adapter
-        can poll ``/get_robot_state``. Default ``wait=True`` is the blocking
-        path. This method does not invent 9-field telemetry.
+        can poll ``/telemetry/poll`` (falling back to ``/get_robot_state``).
+        Default ``wait=True`` is the blocking path. This method does not
+        invent 9-field telemetry.
 
         Returns the raw bridge reply (measured outcome) plus a `route`
         budget object for the evidence stream.
@@ -520,9 +560,14 @@ class OmniSimMobile:
             reply["route"] = budget.to_json()
         return reply
 
-    # -- observation: measured pose ----------------------------------------
-    def observe(self) -> Dict[str, Any]:
-        st = self._post("/get_robot_state", {"robot_id": self.robot_id})
+    def _state_to_observation(self, st: Any) -> Dict[str, Any]:
+        """Map a bridge JSON body to observe()/poll_telemetry() shape.
+
+        Passes through optional 9-field keys only when present. Missing
+        telemetry stays missing — never filled with zeros here.
+        """
+        if not isinstance(st, dict):
+            return {"pose": None, "yaw": None, "note": "non-dict state"}
         if "x" in st:
             out: Dict[str, Any] = {
                 "pose": [st["x"], st.get("y", 0.0)],
@@ -530,19 +575,41 @@ class OmniSimMobile:
                 "sim_time": st.get("sim_time"),
                 "mode": st.get("mode"),
             }
-            # Pass through optional telemetry only when the bridge actually
-            # sent it. Do not invent odom / cmd_vel / world-root zeros.
-            for key in (
-                "raw_world_root", "world_root", "world_x", "world_y",
-                "odometry", "odom", "odometry_pose",
-                "cmd_vel", "v_linear", "v_angular", "linear", "angular",
-                "odom_time", "cmd_vel_time", "world_root_time",
-                "arrived", "settled", "timed_out",
-            ):
+            for key in _TELEMETRY_PASSTHROUGH_KEYS:
                 if key in st and st[key] is not None:
                     out[key] = st[key]
             return out
-        return {"pose": None, "yaw": None, "note": st.get("error")}
+        pose = st.get("pose")
+        if pose is not None:
+            out = {
+                "pose": pose,
+                "yaw": st.get("yaw"),
+                "sim_time": st.get("sim_time"),
+                "mode": st.get("mode"),
+            }
+            for key in _TELEMETRY_PASSTHROUGH_KEYS:
+                if key in st and st[key] is not None:
+                    out[key] = st[key]
+            return out
+        return {"pose": None, "yaw": None, "note": st.get("error") or st.get("body")}
+
+    # -- observation: measured pose ----------------------------------------
+    def observe(self) -> Dict[str, Any]:
+        st = self._post(GET_ROBOT_STATE_PATH, {"robot_id": self.robot_id})
+        return self._state_to_observation(st)
+
+    def poll_telemetry(self) -> Dict[str, Any]:
+        """Mid-drive tick: POST /telemetry/poll, else /get_robot_state.
+
+        This is the non-blocking polling path used while wait=False
+        drive_to_waypoint is in motion. It does not invent the nine
+        attribution fields; whatever OmniSim sent is passed through.
+        """
+        st = self._post(TELEMETRY_POLL_PATH, {"robot_id": self.robot_id})
+        mapped = self._state_to_observation(st)
+        if _observation_has_pose(mapped):
+            return mapped
+        return self.observe()
 
 
 # ======================================================================== #
@@ -858,9 +925,10 @@ class Adapter:
         """One dispatch, then poll or a single after-snapshot.
 
         Nonblocking: ``wait=False`` (detected *before* this call's drive
-        POST) then poll observe() until terminal / budget / stop. Each
-        poll appends ``AttributionLogger.record``. Blocking-only stubs:
-        one dispatch, before/after only. Never TypeError-retry a second
+        POST) then poll ``poll_telemetry()`` (/telemetry/poll, else
+        /get_robot_state) until terminal / budget / stop. Each poll
+        appends ``AttributionLogger.record``. Blocking-only stubs: one
+        dispatch, before/after only. Never TypeError-retry a second
         drive. Completion is still arrived+settled and not timed_out.
         """
         logger = AttributionLogger(robot_id=assignment.robot_id)
@@ -896,7 +964,7 @@ class Adapter:
             ):
                 if interval and interval > 0.0:
                     time.sleep(interval)
-                after = robot.observe()
+                after = _mid_drive_observation(robot)
                 after_snap = pose_snapshot("mid", after)
                 snapshots.append(after_snap)
                 logger.record(
@@ -907,7 +975,7 @@ class Adapter:
                 dispatch = _merge_poll_observation(dispatch, after)
                 polls += 1
             if after_snap is before_snap:
-                after = robot.observe()
+                after = _mid_drive_observation(robot)
                 after_snap = pose_snapshot("after", after)
                 snapshots.append(after_snap)
                 logger.record(
@@ -1244,6 +1312,20 @@ class Adapter:
         )
         self.evidence.append(rec)
 
+        log.info(
+            "attribution_diagnosis request_id=%s class=%s R=%s "
+            "vector_residual_m_s=%s heading_error_rad=%s "
+            "fail_streak_peak=%s n=%s recover_recommended=%s",
+            assignment.request_id,
+            attribution_diagnosis.get("classification"),
+            attribution_diagnosis.get("r_ratio"),
+            attribution_diagnosis.get("vector_residual_m_s"),
+            attribution_diagnosis.get("heading_error_rad"),
+            attribution_diagnosis.get("fail_streak_peak"),
+            attribution_diagnosis.get("recover_fail_streak_n"),
+            attribution_diagnosis.get("recover_recommended"),
+        )
+
         # Any terminal outcome frees the request id, so a later genuine
         # identical assignment is NOT a duplicate. Adapter-side aborts are
         # terminal: the pose was unusable, and retrying the same id would
@@ -1257,10 +1339,13 @@ class Adapter:
         if recover:
             log.warning(
                 "attribution_recover robot=%s request_id=%s R=%s class=%s "
+                "vector_residual_m_s=%s heading_error_rad=%s "
                 "fail_streak_peak=%s n=%s",
                 assignment.robot_id, assignment.request_id,
                 attribution_diagnosis.get("r_ratio"),
                 attribution_diagnosis.get("classification"),
+                attribution_diagnosis.get("vector_residual_m_s"),
+                attribution_diagnosis.get("heading_error_rad"),
                 attribution_diagnosis.get("fail_streak_peak"),
                 attribution_diagnosis.get("recover_fail_streak_n"),
             )

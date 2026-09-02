@@ -78,16 +78,18 @@ ticket, installs a new immutable manifest copy, and logs a receipt.
 
 6. **Mid-drive polling vs blocking fallback.** For navigate/drive the
    adapter prefers `wait=False` (or equivalent) and polls
-   `/get_robot_state` on a short interval, appending an
-   `AttributionSample` on each tick. Support is detected *before* any
-   drive POST via `capabilities()` (explicit `nonblocking_wait`) and/or
-   `inspect.signature(dispatch)` for a `wait` parameter. A blocking-only
-   stub (no `wait`, or `nonblocking_wait: false`) falls back to the
-   existing before/after snapshots — one dispatch, no TypeError retry,
-   no second drive. This adapter does **not** claim OmniSim already
-   streams the nine fields; absent keys stay `None`. Polling does not
-   weaken the completion gate: completed iff `arrived=true`,
-   `settled=true`, `timed_out=false`.
+   `/telemetry/poll` on a short interval, appending an
+   `AttributionSample` on each tick. `/get_robot_state` remains the
+   observe / route-billing path and the fallback when `/telemetry/poll`
+   is absent (HTTP 404) or returns no pose. Support for nonblocking wait
+   is detected *before* any drive POST via `capabilities()` (explicit
+   `nonblocking_wait`) and/or `inspect.signature(dispatch)` for a `wait`
+   parameter. A blocking-only stub (no `wait`, or `nonblocking_wait:
+   false`) falls back to the existing before/after snapshots — one
+   dispatch, no TypeError retry, no second drive. This adapter does
+   **not** claim OmniSim already streams the nine fields; absent keys
+   stay `None`. Polling does not weaken the completion gate: completed
+   iff `arrived=true`, `settled=true`, `timed_out=false`.
 
 7. **Recovery hysteresis.** Do not call `recover_robot()` on a single
    `R ≥ 1.1` sample. `diagnose_trace` requires **N=3** consecutive
@@ -101,8 +103,11 @@ ticket, installs a new immutable manifest copy, and logs a receipt.
    `heading_error_rad` = wrapped atan2(v_measured) − atan2(v_expected)
    (OmniLink comparison of measured world velocity vs
    `[vx cos yaw, vx sin yaw]`, **not** yaw vs commanded heading).
-   Incomplete samples leave both `None`. `Adapter.run` recovers only
-   after this consecutive-complete rule.
+   Incomplete samples leave both `None`. Those two fields are stamped
+   on each complete sample diagnosis **and** on the trace-level
+   `attribution_diagnosis` alongside `r_ratio`, and logged on the
+   evidence path. `Adapter.run` recovers only after this
+   consecutive-complete rule.
 
    This does **not** fix Husky turn-control. The last live four-Husky
    result (5.1111 m and 7.0711 m misses) remains governing. `--live`

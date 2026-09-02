@@ -32,6 +32,8 @@ from omnisim_seam import (
     OmniSimMobile,
     SPAWN_LOCATIONS,
     WAYPOINTS,
+    GET_ROBOT_STATE_PATH,
+    TELEMETRY_POLL_PATH,
     evaluate_completion_gate,
     annotate_completion_geometry,
 )
@@ -59,6 +61,7 @@ class FakeMobile:
         )
         self.dispatches: list[dict] = []
         self.observe_calls = 0
+        self.poll_telemetry_calls = 0
         self._driving = False
         self._poll_i = 0
 
@@ -124,6 +127,11 @@ class FakeMobile:
             st.setdefault("mode", "idle")
             return st
         return {"pose": list(self.pose), "yaw": 0.0, "sim_time": 1.0, "mode": "idle"}
+
+    def poll_telemetry(self) -> dict:
+        """Named mid-drive path used by Adapter._mid_drive_observation."""
+        self.poll_telemetry_calls += 1
+        return self.observe()
 
 
 @pytest.fixture
@@ -462,3 +470,47 @@ def test_rejected_attempt_captured_not_thrown(adapter_factory):
     assert rec.accepted is False
     assert rec.outcome == "completed" or rec.outcome == "rejected"
     assert rec.observation_after is not None
+
+
+def test_omnisim_mobile_poll_telemetry_posts_named_path():
+    mobile = OmniSimMobile("robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"])
+    posts: list[str] = []
+
+    def _post(path, body, timeout_s=None):
+        posts.append(path)
+        if path == TELEMETRY_POLL_PATH:
+            return {
+                "x": 1.0, "y": 2.0, "yaw": 0.1,
+                "raw_world_root": [1.0, 2.0],
+                "odometry_pose": [1.0, 2.0],
+                "cmd_vel": {"linear": {"x": 0.4}, "angular": {"z": 0.0}},
+                "world_dx_dt": 0.4, "world_dy_dt": 0.0,
+            }
+        raise AssertionError(f"unexpected path {path}")
+
+    mobile._post = _post  # type: ignore[method-assign]
+    st = mobile.poll_telemetry()
+    assert posts == [TELEMETRY_POLL_PATH]
+    assert st["pose"] == [1.0, 2.0]
+    assert st["raw_world_root"] == [1.0, 2.0]
+    assert st["world_dx_dt"] == 0.4
+    assert st.get("cmd_vel") is not None
+
+
+def test_omnisim_mobile_poll_telemetry_falls_back_to_get_robot_state():
+    mobile = OmniSimMobile("robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"])
+    posts: list[str] = []
+
+    def _post(path, body, timeout_s=None):
+        posts.append(path)
+        if path == TELEMETRY_POLL_PATH:
+            return {"ok": False, "http": 404, "body": "not found"}
+        if path == GET_ROBOT_STATE_PATH:
+            return {"x": 3.0, "y": 4.0, "yaw": 0.2}
+        raise AssertionError(f"unexpected path {path}")
+
+    mobile._post = _post  # type: ignore[method-assign]
+    st = mobile.poll_telemetry()
+    assert posts == [TELEMETRY_POLL_PATH, GET_ROBOT_STATE_PATH]
+    assert st["pose"] == [3.0, 4.0]
+    assert "raw_world_root" not in st  # not invented on the fallback body

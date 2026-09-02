@@ -394,8 +394,11 @@ def attribution_sample_from_observation(
         if extra_f is not None:
             stamps.append(extra_f)
 
-    dx_dt, dy_dt = (None, None)
-    if prev_sample is not None:
+    explicit_dx = _finite(obs.get("world_dx_dt"))
+    explicit_dy = _finite(obs.get("world_dy_dt"))
+    if explicit_dx is not None and explicit_dy is not None:
+        dx_dt, dy_dt = explicit_dx, explicit_dy
+    elif prev_sample is not None:
         dt = _dt_between(
             prev_sample.sim_time, sim_time, prev_sample.wall_time, stamp,
         )
@@ -404,6 +407,8 @@ def attribution_sample_from_observation(
             (bridge_x, bridge_y),
             dt,
         )
+    else:
+        dx_dt, dy_dt = (None, None)
 
     return AttributionSample(
         raw_world_root=extract_raw_world_root(obs),
@@ -509,6 +514,8 @@ class TraceDiagnosis:
     fail_streak: int = 0
     fail_streak_peak: int = 0
     recover_fail_streak_n: int = RECOVER_FAIL_STREAK_N
+    vector_residual_m_s: Optional[float] = None
+    heading_error_rad: Optional[float] = None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -517,6 +524,8 @@ class TraceDiagnosis:
             "classification": self.classification.value,
             "reasons": list(self.reasons),
             "r_ratio": self.r_ratio,
+            "vector_residual_m_s": self.vector_residual_m_s,
+            "heading_error_rad": self.heading_error_rad,
             "recover_recommended": self.recover_recommended,
             "fail_streak": self.fail_streak,
             "fail_streak_peak": self.fail_streak_peak,
@@ -870,7 +879,8 @@ def diagnose_trace(
     complete, time-aligned failing samples (default 3). Incomplete and
     temporally misaligned ticks hold the streak; a clean complete sample
     resets it. Per-sample residual / heading error live on each sample
-    diagnosis.
+    diagnosis; the trace copies those two values from the same complete
+    sample that supplies ``r_ratio`` so they are stamped alongside R.
     """
     diagnosed = [diagnose_sample(sample) for sample in samples]
     n = _normalize_fail_streak_n(recover_fail_streak_n)
@@ -904,13 +914,26 @@ def diagnose_trace(
         # are neither failing nor clean: hold the streak.
 
     recover = peak >= n
-    recover_ratios = [
-        item.r_ratio
-        for item in diagnosed
+    recover_items = [
+        item for item in diagnosed
         if _is_failing_complete(item) and item.r_ratio is not None
     ]
-    ratios = [item.r_ratio for item in diagnosed if item.r_ratio is not None]
-    r_ratio = recover_ratios[-1] if recover_ratios else (ratios[-1] if ratios else None)
+    ratio_items = [item for item in diagnosed if item.r_ratio is not None]
+    residual_items = [
+        item for item in diagnosed
+        if item.vector_residual_m_s is not None or item.heading_error_rad is not None
+    ]
+    if recover_items:
+        anchor = recover_items[-1]
+    elif ratio_items:
+        anchor = ratio_items[-1]
+    elif residual_items:
+        anchor = residual_items[-1]
+    else:
+        anchor = None
+    r_ratio = anchor.r_ratio if anchor is not None else None
+    residual = anchor.vector_residual_m_s if anchor is not None else None
+    heading_err = anchor.heading_error_rad if anchor is not None else None
 
     reasons: List[str] = []
     for index, item in enumerate(diagnosed):
@@ -965,4 +988,6 @@ def diagnose_trace(
         fail_streak=streak,
         fail_streak_peak=peak,
         recover_fail_streak_n=n,
+        vector_residual_m_s=residual,
+        heading_error_rad=heading_err,
     )
