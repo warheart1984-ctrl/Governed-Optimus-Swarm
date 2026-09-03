@@ -6,6 +6,34 @@ owns. The physical Husky miss was a turn-control failure on their path;
 we are not rerunning against that known-failing path, and we are not
 patching their physics layer.
 
+This is a **Governed Runtime Control Plane Prototype**, not a certified
+production system. `--live` stays off. This work does not fix OmniSim
+Husky turn-control.
+
+## Governed admission (prototype, not PKI)
+
+The adapter no longer dispatches from an unbound raw swarm dict as the
+sole authority. `Adapter.run` is: envelope assignment → `admit()` →
+dispatch only if admitted.
+
+`AdmissionRecord` is a bound dataclass (robot_id, task_id, target, policy,
+request_id, source_log, state_hash, role, admission_id, issued_at, digest).
+The digest is HMAC-SHA256 over canonical JSON plus a run-scoped secret
+from `RunManifest`. Missing or mismatched `state_hash` / digest rejects
+on the negative path (`rejected_admission` / `unverified`) with **no**
+motion command. FakeMobile tests compute this locally. That is prototype
+independent verification, not a public-key infrastructure.
+
+Each physical attempt is bound to a one-use `operation_id` (UUID4). The
+dispatch signature is resolved with `inspect.signature` *before* the first
+call. There is no `except TypeError: dispatch(...)` retry. Replay of the
+same id is rejected with no HTTP.
+
+Robot roles are frozen in an immutable `RunManifest` at adapter/swarm
+startup. `robot.role = ...` after init does not change admitted authority.
+An authorized `rebind_role(..., authorization=ticket)` verifies a hashed
+ticket, installs a new immutable manifest copy, and logs a receipt.
+
 ## What changed
 
 1. **Route distance is billed from the observed starting pose.**
@@ -46,12 +74,44 @@ patching their physics layer.
    (raw world root, bridge x/y/yaw, odometry pose, commanded body
    `linear.x` / `angular.z`, pose-derived world `dx/dt` `dy/dt`) plus a
    pure diagnostic (`omnisim_seam/geometry_attribution.py`). Missing
-   OmniSim fields stay `None`; they are not filled with zeros. `R ≥ 1.1`
-   on a real Adapter run calls `recover_robot()` to clear the in-flight
-   envelope and stamp `aborted` / `recover-{id}`. This does **not** fix
-   Husky turn-control. The last live four-Husky result (5.1111 m and
-   7.0711 m misses) remains governing. `--live` stays off until OmniLink
-   sends a physics fix commit.
+   OmniSim fields stay `None`; they are not filled with zeros.
+
+6. **Mid-drive polling vs blocking fallback.** For navigate/drive the
+   adapter prefers `wait=False` (or equivalent) and polls
+   `/telemetry/poll` on a short interval, appending an
+   `AttributionSample` on each tick. `/get_robot_state` remains the
+   observe / route-billing path and the fallback when `/telemetry/poll`
+   is absent (HTTP 404) or returns no pose. Support for nonblocking wait
+   is detected *before* any drive POST via `capabilities()` (explicit
+   `nonblocking_wait`) and/or `inspect.signature(dispatch)` for a `wait`
+   parameter. A blocking-only stub (no `wait`, or `nonblocking_wait:
+   false`) falls back to the existing before/after snapshots — one
+   dispatch, no TypeError retry, no second drive. This adapter does
+   **not** claim OmniSim already streams the nine fields; absent keys
+   stay `None`. Polling does not weaken the completion gate: completed
+   iff `arrived=true`, `settled=true`, `timed_out=false`.
+
+7. **Recovery hysteresis.** Do not call `recover_robot()` on a single
+   `R ≥ 1.1` sample. `diagnose_trace` requires **N=3** consecutive
+   complete, time-aligned failing samples (configurable
+   `recover_fail_streak_n`). Incomplete or temporally misaligned ticks
+   **hold** the streak (neither increment nor reset). A clean complete
+   sample **resets** it. A failing sample is complete + time-aligned +
+   `recover_recommended` / `R ≥ 1.1` (`double_frame` or
+   `integration_tick_rate`). Alongside R, each complete diagnosis
+   records `vector_residual_m_s` = ||v_measured − v_expected|| and
+   `heading_error_rad` = wrapped atan2(v_measured) − atan2(v_expected)
+   (OmniLink comparison of measured world velocity vs
+   `[vx cos yaw, vx sin yaw]`, **not** yaw vs commanded heading).
+   Incomplete samples leave both `None`. Those two fields are stamped
+   on each complete sample diagnosis **and** on the trace-level
+   `attribution_diagnosis` alongside `r_ratio`, and logged on the
+   evidence path. `Adapter.run` recovers only after this
+   consecutive-complete rule.
+
+   This does **not** fix Husky turn-control. The last live four-Husky
+   result (5.1111 m and 7.0711 m misses) remains governing. `--live`
+   stays off until OmniLink sends a physics fix commit.
 
 ## Why
 
@@ -79,13 +139,16 @@ path-following accuracy.
 - Pose drift and remaining-distance delta make a later live run
   comparable to this one without reconstructing the geometry by hand.
 - When OmniSim (or a future logger tick) supplies odom / cmd_vel /
-  world-root on each sample, `diagnose_trace()` reports R and a
-  classification (`clean`, `double_frame`, `integration_tick_rate`)
-  without flipping the completion gate.
+  world-root on each sample, `diagnose_trace()` reports R, residual,
+  heading error, and a classification (`clean`, `double_frame`,
+  `integration_tick_rate`) without flipping the completion gate.
+  Recovery stays hysteresis-gated (N=3 consecutive complete fails).
+  The adapter still does not invent those nine fields.
 
 The adapter still does not estimate slip, curvature, or turn rate. Those
 stay on the OmniSim side of the seam. This attribution logger does not
-change that, and it is not a green light to rerun `--live`.
+change that, and it is not a green light to rerun `--live`. The last live
+four-Husky miss (5.1111 m / 7.0711 m) remains the governing result.
 
 ## How it interacts with the completion gate
 

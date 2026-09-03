@@ -32,6 +32,8 @@ from omnisim_seam import (
     OmniSimMobile,
     SPAWN_LOCATIONS,
     WAYPOINTS,
+    GET_ROBOT_STATE_PATH,
+    TELEMETRY_POLL_PATH,
     evaluate_completion_gate,
     annotate_completion_geometry,
 )
@@ -41,36 +43,95 @@ from omnisim_seam import (
 # Fake OmniSim mobile bridge: no network, deterministic measured pose.      #
 # ------------------------------------------------------------------------- #
 class FakeMobile:
-    """Stands in for OmniSimMobile. Proves the seam, not the simulator."""
+    """Stands in for OmniSimMobile. Proves the seam, not the simulator.
+
+    Default is blocking-only (no wait=False / no mid-drive sequence).
+    Pass ``poll_states`` or ``in_motion`` to opt into the adapter's
+    nonblocking poll path. Adapter tests must not require live OmniSim.
+    """
 
     def __init__(self, robot_id: str, pose=(0.0, 0.0), outcome="completed",
-                 snap_to=None):
+                 snap_to=None, poll_states=None, in_motion=None):
         self.robot_id = robot_id
         self.pose = list(pose)
         self.outcome = outcome          # "completed" | "rejected" | "transport_error"
         self.snap_to = snap_to          # optional pose after a successful dispatch
+        self.poll_states = list(
+            poll_states if poll_states is not None else (in_motion or [])
+        )
         self.dispatches: list[dict] = []
         self.observe_calls = 0
+        self.poll_telemetry_calls = 0
+        self._driving = False
+        self._poll_i = 0
 
-    def dispatch(self, assignment: Assignment, start_pose=None) -> dict:
+    def capabilities(self) -> dict:
+        # Explicit: default FakeMobile is blocking-only. Poll sequences
+        # opt into wait=False. Detected before any drive POST.
+        return {"nonblocking_wait": bool(self.poll_states)}
+
+    def dispatch(self, assignment: Assignment, start_pose=None, operation_id=None,
+                 wait=True) -> dict:
         record = {
             "robot_id": assignment.robot_id,
             "policy": assignment.policy,
             "target": assignment.target,
             "start_pose": start_pose,
+            "operation_id": operation_id,
+            "wait": wait,
         }
         self.dispatches.append(record)
         if self.outcome == "transport_error":
             return {"ok": False, "error": "transport", "message": "sim down"}
         if self.outcome == "rejected":
             return {"ok": False, "error": "busy", "message": "robot busy"}
+        if wait is False and self.poll_states:
+            self._driving = True
+            self._poll_i = 0
+            return {
+                "ok": True,
+                "accepted": True,
+                "arrived": False,
+                "settled": False,
+                "timed_out": False,
+            }
         if self.snap_to is not None:
             self.pose = list(self.snap_to)
-        return {"ok": True, "accepted": True, "arrived": True, "settled": True, "timed_out": False}
+        elif self.poll_states:
+            last = self.poll_states[-1]
+            if isinstance(last, dict) and last.get("pose") is not None:
+                self.pose = list(last["pose"])
+        flags = {"ok": True, "accepted": True, "arrived": True, "settled": True, "timed_out": False}
+        if self.poll_states:
+            last = self.poll_states[-1]
+            if isinstance(last, dict):
+                for key in ("arrived", "settled", "timed_out", "ok"):
+                    if key in last:
+                        flags[key] = last[key]
+        return flags
 
     def observe(self) -> dict:
         self.observe_calls += 1
+        if self._driving and self.poll_states:
+            idx = min(self._poll_i, len(self.poll_states) - 1)
+            st = dict(self.poll_states[idx])
+            if self._poll_i < len(self.poll_states):
+                self._poll_i += 1
+            if self._poll_i >= len(self.poll_states):
+                self._driving = False
+            if st.get("pose") is not None:
+                self.pose = list(st["pose"])
+            st.setdefault("pose", list(self.pose))
+            st.setdefault("yaw", 0.0)
+            st.setdefault("sim_time", float(self._poll_i))
+            st.setdefault("mode", "idle")
+            return st
         return {"pose": list(self.pose), "yaw": 0.0, "sim_time": 1.0, "mode": "idle"}
+
+    def poll_telemetry(self) -> dict:
+        """Named mid-drive path used by Adapter._mid_drive_observation."""
+        self.poll_telemetry_calls += 1
+        return self.observe()
 
 
 @pytest.fixture
@@ -409,3 +470,47 @@ def test_rejected_attempt_captured_not_thrown(adapter_factory):
     assert rec.accepted is False
     assert rec.outcome == "completed" or rec.outcome == "rejected"
     assert rec.observation_after is not None
+
+
+def test_omnisim_mobile_poll_telemetry_posts_named_path():
+    mobile = OmniSimMobile("robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"])
+    posts: list[str] = []
+
+    def _post(path, body, timeout_s=None):
+        posts.append(path)
+        if path == TELEMETRY_POLL_PATH:
+            return {
+                "x": 1.0, "y": 2.0, "yaw": 0.1,
+                "raw_world_root": [1.0, 2.0],
+                "odometry_pose": [1.0, 2.0],
+                "cmd_vel": {"linear": {"x": 0.4}, "angular": {"z": 0.0}},
+                "world_dx_dt": 0.4, "world_dy_dt": 0.0,
+            }
+        raise AssertionError(f"unexpected path {path}")
+
+    mobile._post = _post  # type: ignore[method-assign]
+    st = mobile.poll_telemetry()
+    assert posts == [TELEMETRY_POLL_PATH]
+    assert st["pose"] == [1.0, 2.0]
+    assert st["raw_world_root"] == [1.0, 2.0]
+    assert st["world_dx_dt"] == 0.4
+    assert st.get("cmd_vel") is not None
+
+
+def test_omnisim_mobile_poll_telemetry_falls_back_to_get_robot_state():
+    mobile = OmniSimMobile("robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"])
+    posts: list[str] = []
+
+    def _post(path, body, timeout_s=None):
+        posts.append(path)
+        if path == TELEMETRY_POLL_PATH:
+            return {"ok": False, "http": 404, "body": "not found"}
+        if path == GET_ROBOT_STATE_PATH:
+            return {"x": 3.0, "y": 4.0, "yaw": 0.2}
+        raise AssertionError(f"unexpected path {path}")
+
+    mobile._post = _post  # type: ignore[method-assign]
+    st = mobile.poll_telemetry()
+    assert posts == [TELEMETRY_POLL_PATH, GET_ROBOT_STATE_PATH]
+    assert st["pose"] == [3.0, 4.0]
+    assert "raw_world_root" not in st  # not invented on the fallback body

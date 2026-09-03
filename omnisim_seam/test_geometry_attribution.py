@@ -7,7 +7,8 @@ Pins the 6-step protocol on a 9-field AttributionSample:
   3. v_world_expected = [vx cos θ, vx sin θ]
   4. R = ||v_meas|| / ||v_expected||  (clean / double-frame / other)
   5. δ_odom = bridge pose − odometry_pose
-  6. recover_robot() on Adapter when R ≥ 1.1 (not inside pure math)
+  6. recover_robot() on Adapter after N=3 consecutive complete failing
+     samples (not inside pure math; not on a single R ≥ 1.1 tick)
 
 This does not claim a Husky turn-control fix.
 """
@@ -22,6 +23,7 @@ from omnisim_seam.geometry_attribution import (
     AttributionClass,
     AttributionLogger,
     AttributionSample,
+    RECOVER_FAIL_STREAK_N,
     diagnose_sample,
     diagnose_trace,
     extract_cmd_vel,
@@ -97,6 +99,8 @@ def test_incomplete_sample_fail_closed_no_r():
     assert "raw_world_root" in result.missing_fields
     assert "cmd_vel_linear_x" in result.missing_fields
     assert "world_dx_dt" in result.missing_fields
+    assert result.vector_residual_m_s is None
+    assert result.heading_error_rad is None
 
 
 def test_nan_is_incomplete_not_zero():
@@ -187,6 +191,30 @@ def test_logger_derives_velocity_from_successive_poses():
     assert trace.classification is AttributionClass.CLEAN
     assert trace.ok is True
     assert trace.recover_recommended is False
+    assert trace.vector_residual_m_s is not None
+    assert math.isclose(trace.vector_residual_m_s, 0.0, abs_tol=1e-9)
+    assert trace.heading_error_rad is not None
+    assert math.isclose(trace.heading_error_rad, 0.0, abs_tol=1e-9)
+
+
+def test_logger_uses_explicit_world_velocity_from_poll_tick():
+    """A /telemetry/poll tick that already includes dx/dt is complete without a prior pose."""
+    logger = AttributionLogger(robot_id="robot_a")
+    logger.record(
+        {
+            "pose": [1.0, 0.0], "yaw": 0.0, "sim_time": 1.0,
+            "raw_world_root": [1.0, 0.0], "odometry_pose": [1.0, 0.0],
+            "cmd_vel": {"linear": 1.0, "angular": 0.0},
+            "world_dx_dt": 1.0, "world_dy_dt": 0.0,
+        },
+        wall_time=10.0,
+    )
+    assert logger.samples[0].world_dx_dt == 1.0
+    assert logger.samples[0].world_dy_dt == 0.0
+    result = diagnose_sample(logger.samples[0])
+    assert result.classification is AttributionClass.CLEAN
+    assert result.vector_residual_m_s is not None
+    assert result.heading_error_rad is not None
 
 
 def test_diagnose_trace_empty_fail_closed():
@@ -209,10 +237,12 @@ def test_recover_robot_frees_in_flight_request():
     assert recovered.outcome == "aborted"
     assert recovered.request_id == "recover-robot_a"
     assert ad.envelope._open.get("robot_a") is None
+    assert "attribution_trace" in recovered.to_json()
     # Already-clear must not crash; stamps another recover row.
     again = ad.recover_robot("robot_a")
     assert again.outcome == "aborted"
     assert again.request_id == "recover-robot_a"
+    assert "attribution_trace" in again.to_json()
 
 
 class _DoubleFrameFake:
@@ -255,17 +285,19 @@ class _DoubleFrameFake:
         }
 
 
-def test_adapter_recovers_when_r_at_least_1_1():
+def test_adapter_does_not_recover_on_single_r_at_least_1_1():
     ad = Adapter({"robot_a": _DoubleFrameFake()})  # type: ignore[arg-type]
     rec = ad.run(dict(SWARM_LINE_A))
     assert rec is not None
     assert rec.attribution_trace
-    assert rec.attribution_diagnosis["recover_recommended"] is True
     assert rec.attribution_diagnosis["classification"] == "double_frame"
-    recover_rows = [e for e in ad.evidence if e.request_id == "recover-robot_a"]
-    assert len(recover_rows) == 1
-    assert recover_rows[0].outcome == "aborted"
-    assert "robot_a" not in ad.envelope._open
+    # Sample-level R ≥ 1.1 is still flagged; hysteresis withholds recover.
+    assert rec.attribution_diagnosis["fail_streak_peak"] == 1
+    assert rec.attribution_diagnosis["recover_recommended"] is False
+    assert rec.attribution_diagnosis["recover_fail_streak_n"] == RECOVER_FAIL_STREAK_N
+    assert not any(e.request_id == "recover-robot_a" for e in ad.evidence)
+    # Drive completed (arrived+settled), so the in-flight slot is already
+    # freed by mark_terminal — recover() is not what cleared it.
 
 
 def test_adapter_does_not_auto_recover_on_incomplete_trace():
@@ -291,3 +323,345 @@ def test_evidence_json_includes_attribution_trace():
     assert sample["cmd_vel_linear_x"] is None
     assert sample["odometry_pose"] is None
     assert sample["raw_world_root"] is None
+
+
+def test_residual_and_heading_error_on_complete_absent_on_incomplete():
+    clean = diagnose_sample(_complete())
+    assert clean.vector_residual_m_s is not None
+    assert math.isclose(clean.vector_residual_m_s, 0.0, abs_tol=1e-9)
+    assert clean.heading_error_rad is not None
+    assert math.isclose(clean.heading_error_rad, 0.0, abs_tol=1e-9)
+
+    double = diagnose_sample(_complete(world_dx_dt=1.0, world_dy_dt=1.0))
+    assert double.vector_residual_m_s is not None
+    assert math.isclose(double.vector_residual_m_s, 1.0, abs_tol=1e-9)
+    assert double.heading_error_rad is not None
+    assert math.isclose(double.heading_error_rad, math.pi / 4.0, abs_tol=1e-9)
+    payload = double.to_json()
+    assert payload["vector_residual_m_s"] == double.vector_residual_m_s
+    assert payload["heading_error_rad"] == double.heading_error_rad
+
+    incomplete = diagnose_sample(AttributionSample(wall_time=1.0, source_stamps=(1.0,)))
+    assert incomplete.classification is AttributionClass.SAMPLE_INCOMPLETE
+    assert incomplete.vector_residual_m_s is None
+    assert incomplete.heading_error_rad is None
+
+
+def test_diagnose_trace_stamps_residual_and_heading_alongside_r():
+    """Trace-level diagnosis copies ||Δv|| and Δθ next to R, not only per-sample."""
+    failing = _complete(world_dx_dt=1.0, world_dy_dt=1.0)
+    trace = diagnose_trace([failing])
+    payload = trace.to_json()
+    assert payload["r_ratio"] is not None
+    assert math.isclose(payload["vector_residual_m_s"], 1.0, abs_tol=1e-9)
+    assert math.isclose(payload["heading_error_rad"], math.pi / 4.0, abs_tol=1e-9)
+    empty = diagnose_trace([])
+    assert empty.vector_residual_m_s is None
+    assert empty.heading_error_rad is None
+    incomplete = diagnose_trace([AttributionSample(wall_time=1.0, source_stamps=(1.0,))])
+    assert incomplete.vector_residual_m_s is None
+    assert incomplete.heading_error_rad is None
+
+
+def test_diagnose_trace_single_failing_does_not_recover():
+    incomplete = AttributionSample(wall_time=1.0, source_stamps=(1.0,))
+    failing = _complete(world_dx_dt=1.0, world_dy_dt=1.0)
+    trace = diagnose_trace([incomplete, failing])
+    assert trace.fail_streak_peak == 1
+    assert trace.fail_streak == 1
+    assert trace.recover_recommended is False
+    assert trace.recover_fail_streak_n == RECOVER_FAIL_STREAK_N
+    assert trace.samples[1].recover_recommended is True  # sample-level still flags R
+
+
+def test_diagnose_trace_three_consecutive_complete_failing_recovers():
+    samples = [
+        AttributionSample(wall_time=0.0, source_stamps=(0.0,)),
+        _complete(world_dx_dt=1.0, world_dy_dt=1.0, wall_time=1.0, source_stamps=(1.0,)),
+        _complete(world_dx_dt=1.0, world_dy_dt=1.0, wall_time=2.0, source_stamps=(2.0,)),
+        _complete(world_dx_dt=1.0, world_dy_dt=1.0, wall_time=3.0, source_stamps=(3.0,)),
+    ]
+    trace = diagnose_trace(samples)
+    assert trace.fail_streak_peak == 3
+    assert trace.fail_streak == 3
+    assert trace.recover_recommended is True
+    assert trace.samples[0].vector_residual_m_s is None
+    assert trace.samples[1].vector_residual_m_s is not None
+    assert trace.samples[1].heading_error_rad is not None
+
+
+def test_incomplete_holds_fail_streak_clean_resets_it():
+    fail = _complete(world_dx_dt=1.0, world_dy_dt=1.0)
+    incomplete = AttributionSample(wall_time=1.0, source_stamps=(1.0,))
+    clean = _complete()
+    held = diagnose_trace([fail, incomplete, fail])
+    assert held.fail_streak_peak == 2
+    assert held.recover_recommended is False
+    reset = diagnose_trace([fail, clean, fail, fail])
+    assert reset.fail_streak_peak == 2
+    assert reset.recover_recommended is False
+    three_with_gap = diagnose_trace([fail, incomplete, fail, fail])
+    assert three_with_gap.fail_streak_peak == 3
+    assert three_with_gap.recover_recommended is True
+
+
+def test_polling_path_records_mid_drive_samples():
+    states = [
+        {"pose": [1.0, 0.0], "yaw": 0.0, "sim_time": 1.0,
+         "arrived": False, "settled": False, "timed_out": False, "mode": "moving"},
+        {"pose": [2.0, 0.0], "yaw": 0.0, "sim_time": 2.0,
+         "arrived": False, "settled": False, "timed_out": False, "mode": "moving"},
+        {"pose": [4.0, -2.0], "yaw": 0.0, "sim_time": 3.0,
+         "arrived": True, "settled": True, "timed_out": False, "mode": "idle"},
+    ]
+    fake = FakeMobile("robot_a", poll_states=states)
+    ad = Adapter({"robot_a": fake}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert len(rec.attribution_trace) > 2
+    assert fake.dispatches[0]["wait"] is False
+    assert rec.dispatch.get("arrived") is True
+    assert rec.dispatch.get("settled") is True
+    assert rec.dispatch.get("timed_out") is False
+    assert rec.outcome == "completed"
+    assert len(fake.dispatches) == 1
+    assert fake.poll_telemetry_calls > 0
+
+
+def test_blocking_only_stub_before_after_only():
+    class BlockingOnlyStub:
+        def __init__(self, robot_id="robot_a"):
+            self.robot_id = robot_id
+            self.pose = [0.0, 0.0]
+            self.dispatches: list = []
+
+        def dispatch(self, assignment, start_pose=None, operation_id=None):
+            self.dispatches.append({
+                "target": assignment.target,
+                "start_pose": start_pose,
+                "operation_id": operation_id,
+            })
+            self.pose = [4.0, -2.0]
+            return {
+                "ok": True, "arrived": True, "settled": True, "timed_out": False,
+            }
+
+        def observe(self):
+            return {"pose": list(self.pose), "yaw": 0.0, "sim_time": 1.0, "mode": "idle"}
+
+    stub = BlockingOnlyStub()
+    ad = Adapter({"robot_a": stub}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert len(rec.attribution_trace) == 2
+    assert len(stub.dispatches) == 1
+    assert "wait" not in stub.dispatches[0]
+    assert rec.outcome == "completed"
+
+
+def test_default_fakemobile_stays_blocking_before_after():
+    fake = FakeMobile("robot_a")
+    ad = Adapter({"robot_a": fake}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert len(rec.attribution_trace) == 2
+    assert fake.dispatches[0]["wait"] is True
+    assert len(fake.dispatches) == 1
+
+
+class _NineFieldPollingFake:
+    """wait=False stub with honest 9-field mid-drive states (R=√2)."""
+
+    def __init__(self, robot_id: str = "robot_a"):
+        self.robot_id = robot_id
+        self.dispatches: list = []
+        self._n = 0
+        self._frames = [
+            ([0.0, 0.0], 0.0, False, False),
+            ([1.0, 1.0], 1.0, False, False),
+            ([2.0, 2.0], 2.0, False, False),
+            ([3.0, 3.0], 3.0, True, True),
+        ]
+
+    def capabilities(self):
+        return {"nonblocking_wait": True}
+
+    def dispatch(self, assignment, start_pose=None, operation_id=None, wait=True):
+        self.dispatches.append({"wait": wait, "operation_id": operation_id})
+        if wait is False:
+            return {
+                "ok": True, "arrived": False, "settled": False, "timed_out": False,
+                "cmd_vel": {"linear": {"x": 1.0}, "angular": {"z": 0.0}},
+            }
+        return {
+            "ok": True, "arrived": True, "settled": True, "timed_out": False,
+            "cmd_vel": {"linear": {"x": 1.0}, "angular": {"z": 0.0}},
+        }
+
+    def observe(self):
+        pose, sim_time, arrived, settled = self._frames[min(self._n, len(self._frames) - 1)]
+        self._n += 1
+        return {
+            "pose": list(pose),
+            "yaw": 0.0,
+            "sim_time": sim_time,
+            "raw_world_root": list(pose),
+            "odometry_pose": list(pose),
+            "cmd_vel": {"linear": {"x": 1.0}, "angular": {"z": 0.0}},
+            "arrived": arrived,
+            "settled": settled,
+            "timed_out": False,
+            "mode": "idle" if arrived else "moving",
+        }
+
+
+def test_adapter_recovers_after_three_consecutive_complete_failing_samples():
+    fake = _NineFieldPollingFake()
+    ad = Adapter({"robot_a": fake}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert len(rec.attribution_trace) > 2
+    assert rec.attribution_diagnosis["fail_streak_peak"] >= 3
+    assert rec.attribution_diagnosis["recover_recommended"] is True
+    recover_rows = [e for e in ad.evidence if e.request_id == "recover-robot_a"]
+    assert len(recover_rows) == 1
+    assert recover_rows[0].outcome == "aborted"
+    assert "robot_a" not in ad.envelope._open
+    assert fake.dispatches[0]["wait"] is False
+    assert len(fake.dispatches) == 1
+    assert rec.attribution_diagnosis["vector_residual_m_s"] is not None
+    assert rec.attribution_diagnosis["heading_error_rad"] is not None
+
+
+class _TelemetryPollNineFieldFake:
+    """wait=False stub: poll_telemetry supplies 9 fields; observe() does not."""
+
+    def __init__(self, robot_id: str = "robot_a"):
+        self.robot_id = robot_id
+        self.dispatches: list = []
+        self.poll_calls = 0
+        self.observe_calls = 0
+        self._n = 0
+        self._frames = [
+            ([1.0, 0.0], 1.0, False, False),
+            ([2.0, 0.0], 2.0, False, False),
+            ([4.0, -2.0], 3.0, True, True),
+        ]
+
+    def capabilities(self):
+        return {"nonblocking_wait": True}
+
+    def dispatch(self, assignment, start_pose=None, operation_id=None, wait=True):
+        self.dispatches.append({"wait": wait, "operation_id": operation_id})
+        if wait is False:
+            return {
+                "ok": True, "arrived": False, "settled": False, "timed_out": False,
+            }
+        return {
+            "ok": True, "arrived": True, "settled": True, "timed_out": False,
+        }
+
+    def observe(self):
+        self.observe_calls += 1
+        if self.observe_calls == 1:
+            return {"pose": [0.0, 0.0], "yaw": 0.0, "sim_time": 0.0, "mode": "idle"}
+        pose, sim_time, arrived, settled = self._frames[
+            min(max(self._n - 1, 0), len(self._frames) - 1)
+        ]
+        return {
+            "pose": list(pose), "yaw": 0.0, "sim_time": sim_time,
+            "arrived": arrived, "settled": settled, "timed_out": False,
+            "mode": "idle" if arrived else "moving",
+        }
+
+    def poll_telemetry(self):
+        self.poll_calls += 1
+        pose, sim_time, arrived, settled = self._frames[
+            min(self._n, len(self._frames) - 1)
+        ]
+        if self._n < len(self._frames):
+            self._n += 1
+        return {
+            "pose": list(pose),
+            "yaw": 0.0,
+            "sim_time": sim_time,
+            "raw_world_root": list(pose),
+            "odometry_pose": list(pose),
+            "cmd_vel": {"linear": {"x": 1.0}, "angular": {"z": 0.0}},
+            "world_dx_dt": 1.0,
+            "world_dy_dt": 0.0,
+            "arrived": arrived,
+            "settled": settled,
+            "timed_out": False,
+            "mode": "idle" if arrived else "moving",
+        }
+
+
+def test_telemetry_poll_mid_drive_supplies_nine_fields_not_incomplete():
+    fake = _TelemetryPollNineFieldFake()
+    ad = Adapter({"robot_a": fake}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert fake.poll_calls >= 1
+    assert fake.dispatches[0]["wait"] is False
+    assert len(fake.dispatches) == 1
+    classes = [s["classification"] for s in rec.attribution_diagnosis["samples"]]
+    assert "sample_incomplete" in classes  # before observe has no 9 fields
+    assert "clean" in classes  # mid-drive /telemetry/poll ticks do
+    assert rec.attribution_diagnosis["vector_residual_m_s"] is not None
+    assert rec.attribution_diagnosis["heading_error_rad"] is not None
+    assert rec.dispatch.get("arrived") is True
+    assert rec.dispatch.get("settled") is True
+    assert rec.dispatch.get("timed_out") is False
+    assert rec.outcome == "completed"
+
+
+class _Poll404ThenObserveFake:
+    """poll_telemetry is unusable; Adapter must fall back to observe()."""
+
+    def __init__(self, robot_id: str = "robot_a"):
+        self.robot_id = robot_id
+        self.dispatches: list = []
+        self.poll_calls = 0
+        self._n = 0
+        self._frames = [
+            {"pose": [0.0, 0.0], "yaw": 0.0, "sim_time": 0.0,
+             "arrived": False, "settled": False, "timed_out": False, "mode": "idle"},
+            {"pose": [1.0, 0.0], "yaw": 0.0, "sim_time": 1.0,
+             "arrived": False, "settled": False, "timed_out": False, "mode": "moving"},
+            {"pose": [4.0, -2.0], "yaw": 0.0, "sim_time": 2.0,
+             "arrived": True, "settled": True, "timed_out": False, "mode": "idle"},
+        ]
+
+    def capabilities(self):
+        return {"nonblocking_wait": True}
+
+    def dispatch(self, assignment, start_pose=None, operation_id=None, wait=True):
+        self.dispatches.append({"wait": wait})
+        if wait is False:
+            return {
+                "ok": True, "arrived": False, "settled": False, "timed_out": False,
+            }
+        return {"ok": True, "arrived": True, "settled": True, "timed_out": False}
+
+    def poll_telemetry(self):
+        self.poll_calls += 1
+        return {"ok": False, "http": 404, "body": "no such route"}
+
+    def observe(self):
+        st = dict(self._frames[min(self._n, len(self._frames) - 1)])
+        if self._n < len(self._frames):
+            self._n += 1
+        return st
+
+
+def test_telemetry_poll_404_falls_back_to_observe():
+    fake = _Poll404ThenObserveFake()
+    ad = Adapter({"robot_a": fake}, poll_interval_s=0.0)  # type: ignore[arg-type]
+    rec = ad.run(dict(SWARM_LINE_A))
+    assert rec is not None
+    assert fake.poll_calls >= 1
+    assert rec.dispatch.get("arrived") is True
+    assert rec.dispatch.get("settled") is True
+    assert rec.outcome == "completed"
+    assert len(rec.attribution_trace) > 2

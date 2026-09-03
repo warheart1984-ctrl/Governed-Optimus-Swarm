@@ -24,6 +24,20 @@ Honesty: missing telemetry stays None. This file never invents zeros, never
 talks HTTP, and never claims a live Husky fix. ``--live`` stays off until
 OmniLink sends a physics fix commit. The last live four-Husky result
 (5.1111 m / 7.0711 m misses) remains governing.
+
+Recovery hysteresis (adapter-side): a single complete sample with R ≥ 1.1
+does **not** warrant ``recover_robot()``. ``diagnose_trace`` requires
+``RECOVER_FAIL_STREAK_N`` (default 3) consecutive *complete, time-aligned*
+failing samples. Incomplete or temporally misaligned ticks hold the streak
+(neither increment nor reset). A clean complete sample resets it to 0.
+
+Alongside R, each complete diagnosis records:
+
+  * ``vector_residual_m_s`` — ||v_measured − v_expected||
+  * ``heading_error_rad`` — wrapped atan2(v_measured) − atan2(v_expected),
+    i.e. the OmniLink comparison of measured world velocity vs
+    ``[vx * cos(yaw), vx * sin(yaw)]``. This is **not** yaw vs a commanded
+    heading. Either near-zero vector leaves heading error None.
 """
 
 from __future__ import annotations
@@ -46,6 +60,10 @@ ALIGNMENT_DT_MAX_S = 0.010
 # Recover the in-flight envelope when the measured/expected speed ratio
 # meets or exceeds this. Double-frame (R ≈ √2) is above this line.
 R_RECOVER_THRESHOLD = 1.1
+
+# Consecutive complete, time-aligned failing samples required before the
+# adapter calls recover_robot(). Configurable; Adapter threads this through.
+RECOVER_FAIL_STREAK_N = 3
 
 # Clean: R near 1 and the world-velocity vectors match.
 R_CLEAN_LOW = 0.9
@@ -376,8 +394,11 @@ def attribution_sample_from_observation(
         if extra_f is not None:
             stamps.append(extra_f)
 
-    dx_dt, dy_dt = (None, None)
-    if prev_sample is not None:
+    explicit_dx = _finite(obs.get("world_dx_dt"))
+    explicit_dy = _finite(obs.get("world_dy_dt"))
+    if explicit_dx is not None and explicit_dy is not None:
+        dx_dt, dy_dt = explicit_dx, explicit_dy
+    elif prev_sample is not None:
         dt = _dt_between(
             prev_sample.sim_time, sim_time, prev_sample.wall_time, stamp,
         )
@@ -386,6 +407,8 @@ def attribution_sample_from_observation(
             (bridge_x, bridge_y),
             dt,
         )
+    else:
+        dx_dt, dy_dt = (None, None)
 
     return AttributionSample(
         raw_world_root=extract_raw_world_root(obs),
@@ -451,6 +474,8 @@ class AttributionDiagnosis:
     stamp_spread_s: Optional[float] = None
     pre_dispatch_drift: bool = False
     missing_fields: Tuple[str, ...] = field(default_factory=tuple)
+    vector_residual_m_s: Optional[float] = None
+    heading_error_rad: Optional[float] = None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -471,6 +496,8 @@ class AttributionDiagnosis:
             "stamp_spread_s": self.stamp_spread_s,
             "pre_dispatch_drift": self.pre_dispatch_drift,
             "missing_fields": list(self.missing_fields),
+            "vector_residual_m_s": self.vector_residual_m_s,
+            "heading_error_rad": self.heading_error_rad,
         }
 
 
@@ -484,6 +511,11 @@ class TraceDiagnosis:
     samples: List[AttributionDiagnosis] = field(default_factory=list)
     r_ratio: Optional[float] = None
     recover_recommended: bool = False
+    fail_streak: int = 0
+    fail_streak_peak: int = 0
+    recover_fail_streak_n: int = RECOVER_FAIL_STREAK_N
+    vector_residual_m_s: Optional[float] = None
+    heading_error_rad: Optional[float] = None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -492,7 +524,12 @@ class TraceDiagnosis:
             "classification": self.classification.value,
             "reasons": list(self.reasons),
             "r_ratio": self.r_ratio,
+            "vector_residual_m_s": self.vector_residual_m_s,
+            "heading_error_rad": self.heading_error_rad,
             "recover_recommended": self.recover_recommended,
+            "fail_streak": self.fail_streak,
+            "fail_streak_peak": self.fail_streak_peak,
+            "recover_fail_streak_n": self.recover_fail_streak_n,
             "samples": [sample.to_json() for sample in self.samples],
         }
 
@@ -553,6 +590,90 @@ def expected_world_velocity(
         cmd_vel_linear_x * math.cos(bridge_yaw),
         cmd_vel_linear_x * math.sin(bridge_yaw),
     )
+
+
+def vector_residual_m_s(
+    v_measured: Optional[Tuple[Optional[float], Optional[float]]],
+    v_expected: Optional[Tuple[Optional[float], Optional[float]]],
+) -> Optional[float]:
+    """||v_measured − v_expected||. None when either vector is incomplete."""
+    if v_measured is None or v_expected is None:
+        return None
+    mx, my = v_measured
+    ex, ey = v_expected
+    if mx is None or my is None or ex is None or ey is None:
+        return None
+    if not all(math.isfinite(part) for part in (mx, my, ex, ey)):
+        return None
+    return _hypot(mx - ex, my - ey)
+
+
+def heading_error_from_world_velocities(
+    v_measured: Optional[Tuple[Optional[float], Optional[float]]],
+    v_expected: Optional[Tuple[Optional[float], Optional[float]]],
+) -> Optional[float]:
+    """Wrapped atan2(v_measured) − atan2(v_expected).
+
+    This is the OmniLink comparison: direction of measured world velocity
+    versus expected ``[vx * cos(yaw), vx * sin(yaw)]``. It is not yaw
+    versus a commanded heading. Near-zero either vector → None (direction
+    undefined; not invented).
+    """
+    if v_measured is None or v_expected is None:
+        return None
+    mx, my = v_measured
+    ex, ey = v_expected
+    if mx is None or my is None or ex is None or ey is None:
+        return None
+    if not all(math.isfinite(part) for part in (mx, my, ex, ey)):
+        return None
+    if _hypot(mx, my) <= ZERO_VEL_EPS or _hypot(ex, ey) <= ZERO_VEL_EPS:
+        return None
+    return wrap_heading_rad(math.atan2(my, mx) - math.atan2(ey, ex))
+
+
+def _kinematics_residuals(
+    v_measured: Optional[Tuple[Optional[float], Optional[float]]],
+    v_expected: Optional[Tuple[Optional[float], Optional[float]]],
+) -> Tuple[Optional[float], Optional[float]]:
+    return (
+        vector_residual_m_s(v_measured, v_expected),
+        heading_error_from_world_velocities(v_measured, v_expected),
+    )
+
+
+def _is_unusable_for_streak(item: AttributionDiagnosis) -> bool:
+    """Incomplete / misaligned ticks hold the fail streak (no increment, no reset)."""
+    return item.classification in (
+        AttributionClass.SAMPLE_INCOMPLETE,
+        AttributionClass.TEMPORAL_MISALIGNED,
+    )
+
+
+def _is_failing_complete(item: AttributionDiagnosis) -> bool:
+    """Complete + time-aligned + recover_recommended / R ≥ 1.1.
+
+    double_frame and integration_tick_rate with R ≥ 1.1 already set
+    recover_recommended on diagnose_sample.
+    """
+    if _is_unusable_for_streak(item):
+        return False
+    if item.recover_recommended:
+        return True
+    if item.classification in (
+        AttributionClass.DOUBLE_FRAME,
+        AttributionClass.INTEGRATION_TICK_RATE,
+    ) and item.r_ratio is not None and item.r_ratio >= R_RECOVER_THRESHOLD:
+        return True
+    return False
+
+
+def _normalize_fail_streak_n(value: Any) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return RECOVER_FAIL_STREAK_N
+    return n if n >= 1 else 1
 
 
 def diagnose_sample(sample: AttributionSample) -> AttributionDiagnosis:
@@ -632,6 +753,7 @@ def diagnose_sample(sample: AttributionSample) -> AttributionDiagnosis:
 
     v_expected = expected_world_velocity(vx, yaw)
     v_measured = (dx_dt, dy_dt)
+    residual, heading_err = _kinematics_residuals(v_measured, v_expected)
     exp_norm = _hypot(v_expected[0], v_expected[1])
     meas_norm = _hypot(v_measured[0], v_measured[1])
 
@@ -653,6 +775,8 @@ def diagnose_sample(sample: AttributionSample) -> AttributionDiagnosis:
                 recover_recommended=False,
                 stamp_spread_s=spread,
                 pre_dispatch_drift=pre_drift,
+                vector_residual_m_s=residual,
+                heading_error_rad=heading_err,
             )
         reasons.append(
             "commanded world velocity ~0 but measured motion is non-zero; "
@@ -670,6 +794,8 @@ def diagnose_sample(sample: AttributionSample) -> AttributionDiagnosis:
             recover_recommended=False,
             stamp_spread_s=spread,
             pre_dispatch_drift=pre_drift,
+            vector_residual_m_s=residual,
+            heading_error_rad=heading_err,
         )
 
     r_ratio = meas_norm / exp_norm
@@ -697,6 +823,8 @@ def diagnose_sample(sample: AttributionSample) -> AttributionDiagnosis:
             recover_recommended=recover,
             stamp_spread_s=spread,
             pre_dispatch_drift=pre_drift,
+            vector_residual_m_s=residual,
+            heading_error_rad=heading_err,
         )
 
     if R_CLEAN_LOW < r_ratio < R_CLEAN_HIGH and vectors_match:
@@ -716,6 +844,8 @@ def diagnose_sample(sample: AttributionSample) -> AttributionDiagnosis:
             recover_recommended=False,
             stamp_spread_s=spread,
             pre_dispatch_drift=pre_drift,
+            vector_residual_m_s=residual,
+            heading_error_rad=heading_err,
         )
 
     reasons.append(
@@ -734,12 +864,26 @@ def diagnose_sample(sample: AttributionSample) -> AttributionDiagnosis:
         recover_recommended=recover,
         stamp_spread_s=spread,
         pre_dispatch_drift=pre_drift,
+        vector_residual_m_s=residual,
+        heading_error_rad=heading_err,
     )
 
 
-def diagnose_trace(samples: Iterable[AttributionSample]) -> TraceDiagnosis:
-    """Run diagnose_sample on each timestamped sample. Pure; no recover()."""
+def diagnose_trace(
+    samples: Iterable[AttributionSample],
+    recover_fail_streak_n: int = RECOVER_FAIL_STREAK_N,
+) -> TraceDiagnosis:
+    """Run diagnose_sample on each timestamped sample. Pure; no recover().
+
+    Recovery is warranted only after ``recover_fail_streak_n`` consecutive
+    complete, time-aligned failing samples (default 3). Incomplete and
+    temporally misaligned ticks hold the streak; a clean complete sample
+    resets it. Per-sample residual / heading error live on each sample
+    diagnosis; the trace copies those two values from the same complete
+    sample that supplies ``r_ratio`` so they are stamped alongside R.
+    """
     diagnosed = [diagnose_sample(sample) for sample in samples]
+    n = _normalize_fail_streak_n(recover_fail_streak_n)
     if not diagnosed:
         return TraceDiagnosis(
             ok=False,
@@ -748,16 +892,48 @@ def diagnose_trace(samples: Iterable[AttributionSample]) -> TraceDiagnosis:
             samples=[],
             r_ratio=None,
             recover_recommended=False,
+            fail_streak=0,
+            fail_streak_peak=0,
+            recover_fail_streak_n=n,
         )
 
-    recover = any(item.recover_recommended for item in diagnosed)
-    recover_ratios = [
-        item.r_ratio
-        for item in diagnosed
-        if item.recover_recommended and item.r_ratio is not None
+    streak = 0
+    peak = 0
+    for item in diagnosed:
+        if _is_unusable_for_streak(item):
+            continue
+        if _is_failing_complete(item):
+            streak += 1
+            if streak > peak:
+                peak = streak
+            continue
+        if item.classification is AttributionClass.CLEAN:
+            streak = 0
+            continue
+        # Other complete classifications (e.g. zero_expected_velocity)
+        # are neither failing nor clean: hold the streak.
+
+    recover = peak >= n
+    recover_items = [
+        item for item in diagnosed
+        if _is_failing_complete(item) and item.r_ratio is not None
     ]
-    ratios = [item.r_ratio for item in diagnosed if item.r_ratio is not None]
-    r_ratio = recover_ratios[-1] if recover_ratios else (ratios[-1] if ratios else None)
+    ratio_items = [item for item in diagnosed if item.r_ratio is not None]
+    residual_items = [
+        item for item in diagnosed
+        if item.vector_residual_m_s is not None or item.heading_error_rad is not None
+    ]
+    if recover_items:
+        anchor = recover_items[-1]
+    elif ratio_items:
+        anchor = ratio_items[-1]
+    elif residual_items:
+        anchor = residual_items[-1]
+    else:
+        anchor = None
+    r_ratio = anchor.r_ratio if anchor is not None else None
+    residual = anchor.vector_residual_m_s if anchor is not None else None
+    heading_err = anchor.heading_error_rad if anchor is not None else None
 
     reasons: List[str] = []
     for index, item in enumerate(diagnosed):
@@ -799,8 +975,8 @@ def diagnose_trace(samples: Iterable[AttributionSample]) -> TraceDiagnosis:
         ok = False
     if recover:
         reasons.append(
-            f"R >= {R_RECOVER_THRESHOLD} on at least one sample; "
-            "adapter recover_robot() is indicated for a live envelope"
+            f"fail_streak_peak={peak} >= {n} consecutive complete failing "
+            "samples; adapter recover_robot() is indicated for a live envelope"
         )
     return TraceDiagnosis(
         ok=ok,
@@ -809,4 +985,9 @@ def diagnose_trace(samples: Iterable[AttributionSample]) -> TraceDiagnosis:
         samples=diagnosed,
         r_ratio=r_ratio,
         recover_recommended=recover,
+        fail_streak=streak,
+        fail_streak_peak=peak,
+        recover_fail_streak_n=n,
+        vector_residual_m_s=residual,
+        heading_error_rad=heading_err,
     )

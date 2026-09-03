@@ -6,6 +6,10 @@ Vec2 = Tuple[int, int]
 ZONE_TYPES = {"floor", "storage", "charging", "blocked", "entry"}
 
 
+class DuplicateRobotIdError(ValueError):
+    """Fail-closed: two robots may not share an identity at FloorModel init."""
+
+
 @dataclass
 class Robot:
     id: str
@@ -43,8 +47,30 @@ class FloorModel:
     height: int = 20
 
     def __post_init__(self) -> None:
+        ids = [r.id for r in self.robots]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicates:
+            raise DuplicateRobotIdError(
+                f"duplicate robot ids are forbidden: {duplicates}"
+            )
+        self.cache_generation: int = 0
         self._blocked_cache: Optional[List[Vec2]] = None
         self._zone_map: Dict[Vec2, Zone] = {z.pos: z for z in self.zones}
+
+    def bump_cache_generation(self) -> int:
+        """Invalidate map/zone caches so a stale 'clear' cannot admit motion."""
+        self.cache_generation += 1
+        self._blocked_cache = None
+        self._zone_map = {z.pos: z for z in self.zones}
+        return self.cache_generation
+
+    def update_zones(self, zones: List[Zone]) -> int:
+        self.zones = list(zones)
+        return self.bump_cache_generation()
+
+    def update_tasks(self, tasks: List[TaskNode]) -> int:
+        self.tasks = list(tasks)
+        return self.bump_cache_generation()
 
     @property
     def blocked_positions(self) -> List[Vec2]:
@@ -94,6 +120,7 @@ class FloorModel:
                 "width": self.width,
                 "height": self.height,
             },
+            "cache_generation": self.cache_generation,
         }
 
     def reset_claims(self) -> None:
