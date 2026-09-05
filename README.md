@@ -96,8 +96,8 @@ Offline rerun (no OmniSim required):
 ## Quick Start
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/governed-optimus-swarm.git
-cd governed-optimus-swarm
+git clone https://github.com/warheart1984-ctrl/Governed-Optimus-Swarm.git
+cd Governed-Optimus-Swarm
 
 # Run a simple mining swarm demo
 python -c "
@@ -108,3 +108,27 @@ for _ in range(20):
 print('Mining simulation complete.')
 print(f'Resources remaining: {[r.remaining for r in swarm.model.resources]}')
 "
+
+## Local abort prototype
+
+```bash
+python3 prototype_demo.py
+```
+
+This offline demonstration records one abort and releases an in-flight request.
+It contacts no simulator. Its JSON output reports `abort_recorded`,
+`request_slot_released`, `robot_unlocked`, and `compensation_executed` separately.
+The active `GovernedSwarm` still locks on law violations and skips locked robots.
+`swarm_recovery.py` is an experimental policy model, not an integrated unlock path.
+
+Report these gates separately, even when the full suite passes:
+
+```bash
+python3 -m pytest --collect-only test_swarm_law.py -q
+python3 -m pytest test_swarm_law.py -q
+python3 -m pytest omnisim_seam/test_geometry_attribution.py::test_recover_robot_frees_in_flight_request omnisim_seam/test_control_plane.py::test_recover_twice_is_safe_and_includes_attribution_trace omnisim_seam/test_geometry_attribution.py::test_adapter_recovers_after_three_consecutive_complete_failing_samples -q
+```
+
+Passing these offline tests does not demonstrate a robot stopping or recovering
+in the physical world, nor does it establish the separate AI swarm governor's
+properties.

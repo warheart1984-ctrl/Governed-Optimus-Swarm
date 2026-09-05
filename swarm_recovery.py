@@ -1,23 +1,8 @@
-"""
-Swarm Law Recovery Layer — supervisor/warrant layer for production use.
+"""Experimental recovery-policy state model; not wired into GovernedSwarm.
 
-Purpose: Provide recovery paths for RECOVERABLE law violations (R4, R5, R7)
-while keeping SwarmLaw fail-closed by design (TERMINAL rules: R1, R2, R3, R6).
-
-The base SwarmLaw is NOT modified. This layer wires INTO the LawViolation
-exception path and offers the orchestrator a "deny move, keep state" result
-instead of only raise.
-
-Two public APIs:
-  1. RecoveryPolicy — state machine (attempts / cooldown / quarantined → idle)
-  2. law_gate_with_recovery — wrapper that catches LawViolation and returns
-     a result dict instead of raising, for the orchestrator to decide.
-
-KEEP IN MIND:
-  - RECOVERABLE = {{R4, R5, R7}}   # kinematics / occupancy
-  - TERMINAL    = {{R1, R2, R3, R6}} # identity / role / already locked
-  - SwarmLaw itself remains permanent-lock / R6-blocks-locked-actors
-  - Recovery is opt-in via the wrapper; base law_gate() behavior is unchanged.
+The active orchestrator permanently locks on a law violation. This module does
+not unlock a robot, invoke a supervisor, or provide a law_gate_with_recovery API.
+RecoveryPolicy models recommendations only; it is not a production recovery path.
 """
 
 from __future__ import annotations
@@ -70,9 +55,8 @@ class RecoveryPolicy:
       - RECOVERABLE rules (R4, R5, R7) → attempt / cooldown / quarantined → idle.
       - After max_attempts, fall through to permanent lock.
 
-    The wrapper (law_gate_with_recovery) catches LawViolation and uses this
-    policy to return a result dict. The orchestrator then decides: apply the
-    suggested state, log it, or override.
+    This experimental model returns a recommendation dict. No active
+    orchestrator consumes it.
 
     SwarmLaw itself is NOT modified. This is purely an orchestrator-side
     interposition.
@@ -165,8 +149,8 @@ class RecoveryPolicy:
         """Advance the cooldown for a quarantined robot.
 
         Called once per simulation tick (or wall-clock second) by the
-        orchestrator. When cooldown expires, robot.task is set to "idle",
-        re-entering the assignment loop (still passes law_gate).
+        orchestrator. When cooldown expires, only the internal policy state becomes "idle".
+        This method never changes robot.task or authorizes a move.
 
         This is the ONLY way a quarantined robot returns to idle. The base
         SwarmLaw has no such mechanism.

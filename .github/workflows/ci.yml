@@ -14,12 +14,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest
           python -m pip install -r requirements.txt
+      - name: Law collection
+        run: python -m pytest --collect-only test_swarm_law.py -q
+      - name: Law execution
+        run: python -m pytest test_swarm_law.py -q
+      - name: Adapter recovery contract
+        run: >-
+          python -m pytest
+          omnisim_seam/test_geometry_attribution.py::test_recover_robot_frees_in_flight_request
+          omnisim_seam/test_control_plane.py::test_recover_twice_is_safe_and_includes_attribution_trace
+          omnisim_seam/test_geometry_attribution.py::test_adapter_recovers_after_three_consecutive_complete_failing_samples -q
+      - name: Offline abort demonstration
+        run: python prototype_demo.py
       - name: Offline pytest suite
         env:
           PYTHONPATH: ${{ github.workspace }}

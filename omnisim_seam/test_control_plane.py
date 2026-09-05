@@ -187,8 +187,11 @@ def test_recover_twice_is_safe_and_includes_attribution_trace():
     ad = Adapter({"robot_a": fake})  # type: ignore[arg-type]
     rec = ad.run(dict(SWARM_LINE_A))
     assert rec is not None
+    before = len(ad.evidence)
     first = ad.recover_robot("robot_a")
     second = ad.recover_robot("robot_a")
+    assert len(ad.evidence) == before + 2
+    assert ad.evidence[-2:] == [first, second]
     assert first.outcome == "aborted"
     assert second.outcome == "aborted"
     assert "attribution_trace" in first.to_json()
