@@ -313,6 +313,70 @@ DEFAULT_ROBOT_PORTS: Dict[str, int] = {
 }
 
 
+@dataclass(frozen=True)
+class TurnGainCalibration:
+    """Temporary, evidence-bound compensation for a known Husky under-turn.
+
+    The current OmniSim v8.3 Husky replay reported a commanded +90 deg turn
+    settling at +9.319384209870012 deg. That is a bridge/control gain ratio
+    of about 0.1035, so this adapter sends the reciprocal multiplier with
+    commands for that world/build/robot until OmniLink fixes the physical
+    bridge. It is deliberately visible in evidence instead of hidden in the
+    waypoint or completion gate.
+    """
+
+    world_id: str
+    build_id: str
+    robot_id: str
+    commanded_deg: float
+    achieved_deg: float
+    wheel_radius_m: float = 0.165
+    track_width_m: float = 0.555
+    reason: str = "temporary bridge turn-gain compensation"
+
+    @property
+    def gain_ratio(self) -> float:
+        return self.achieved_deg / self.commanded_deg
+
+    @property
+    def multiplier(self) -> float:
+        ratio = self.gain_ratio
+        if ratio <= 0.0 or not math.isfinite(ratio):
+            return 1.0
+        return 1.0 / ratio
+
+    @property
+    def differential_drive_factor(self) -> float:
+        return self.track_width_m / (2.0 * self.wheel_radius_m)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "world_id": self.world_id,
+            "build_id": self.build_id,
+            "robot_id": self.robot_id,
+            "commanded_deg": self.commanded_deg,
+            "achieved_deg": self.achieved_deg,
+            "gain_ratio": self.gain_ratio,
+            "multiplier": self.multiplier,
+            "wheel_radius_m": self.wheel_radius_m,
+            "track_width_m": self.track_width_m,
+            "differential_drive_factor": self.differential_drive_factor,
+            "reason": self.reason,
+        }
+
+
+DEFAULT_TURN_GAIN_CALIBRATIONS: Dict[str, TurnGainCalibration] = {
+    "husky_ne": TurnGainCalibration(
+        world_id="omnilink_husky_swarm.omniworld",
+        build_id="7d39130cf",
+        robot_id="husky_ne",
+        commanded_deg=90.0,
+        achieved_deg=9.319384209870012,
+    ),
+}
+
+
 def default_spawn_locations(robot_ids: List[str]) -> Dict[str, Waypoint]:
     """Give configured robots deterministic spawn metadata for the seam."""
     return {
@@ -444,7 +508,8 @@ class OmniSimMobile:
     def __init__(self, robot_id: str, base_url: str,
                  spawn: Waypoint, waypoints: Dict[str, Waypoint] = WAYPOINTS,
                  timeout_s: float = 45.0, cruise_speed_mps: float = 0.20,
-                 settle_timeout_s: float = 10.0):
+                 settle_timeout_s: float = 10.0,
+                 turn_gain_calibrations: Optional[Dict[str, TurnGainCalibration]] = None):
         self.robot_id = robot_id
         self.base_url = base_url.rstrip("/")
         self.spawn = spawn
@@ -453,6 +518,11 @@ class OmniSimMobile:
         self.cruise_speed_mps = cruise_speed_mps
         self.settle_timeout_s = settle_timeout_s
         self._used_operation_ids: set[str] = set()
+        self.turn_gain_calibrations = (
+            turn_gain_calibrations
+            if turn_gain_calibrations is not None
+            else DEFAULT_TURN_GAIN_CALIBRATIONS
+        )
 
     def _post(self, path: str, body: Dict[str, Any], timeout_s: Optional[float] = None) -> Dict[str, Any]:
         req = urllib.request.Request(
@@ -551,13 +621,21 @@ class OmniSimMobile:
 
         wait_flag = True if wait is None else bool(wait)
         http_timeout = budget.timeout_s if wait_flag else self.timeout_s
-        reply = self._post("/drive_to_waypoint", {
+        body = {
             "robot_id": self.robot_id,
             "x": wp.x, "y": wp.y, "wait": wait_flag,
-        }, timeout_s=http_timeout)
+        }
+        turn_gain = self.turn_gain_calibrations.get(self.robot_id)
+        if turn_gain is not None:
+            body["turn_gain_multiplier"] = turn_gain.multiplier
+            body["turn_gain_calibration"] = turn_gain.to_json()
+
+        reply = self._post("/drive_to_waypoint", body, timeout_s=http_timeout)
         if isinstance(reply, dict):
             reply = dict(reply)
             reply["route"] = budget.to_json()
+            if turn_gain is not None:
+                reply["turn_gain_calibration"] = turn_gain.to_json()
         return reply
 
     def _state_to_observation(self, st: Any) -> Dict[str, Any]:
@@ -1385,57 +1463,6 @@ class Adapter:
     def export_evidence(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump([r.to_json() for r in self.evidence], f, indent=2)
-
-    def recover_robot(self, robot_id: str, reason: str = "manual_recovery") -> None:
-        """Force-recover a robot from a locked/unhealthy state.
-
-        Unconditionally clears the robot's in-flight request so subsequent
-        assignments are not falsely flagged as duplicates, and records a
-        ``rejected_duplicate``-style evidence entry with
-        ``outcome="aborted"`` so the OmniLink team has an audit trail.
-
-        Call this when your upstream system detects robot.task == "locked"
-        or a failed health check, e.g.:
-
-            if robot.task == "locked":
-                adapter.recover_robot(robot.id, "health_check_failure")
-        """
-        # Unconditionally clear any in-flight request for this robot,
-        # so the envelope no longer considers it "occupied".
-        self.envelope._open.pop(str(robot_id), None)
-
-        # Record a recovery evidence entry so the team can trace why
-        # the robot was stuck and what corrective action was taken.
-        rec = EvidenceRecord(
-            assignment={},
-            request_id=f"recover-{robot_id}",
-            accepted=False,
-            dispatch={},
-            observation_before={},
-            observation_after={},
-            outcome="aborted",
-            pose_snapshots=[],
-            route={},
-            completion_gate={
-                "decision": "aborted",
-                "reasons": [f"recovered: {reason}"],
-                "completion_conflict": False,
-                "geometry_consistent": None,
-            },
-            completion_conflict=False,
-            geometry_consistent=None,
-        )
-        self.evidence.append(rec)
-        log.info(
-            "recovered_robot robot_id=%s reason=%s evidence_recorded",
-            robot_id, reason,
-        )
-        self.evidence.append(rec)
-        log.info(
-            "recovered_robot robot_id=%s reason=%s evidence_recorded",
-            robot_id, reason,
-        )
-
 
 # ======================================================================== #
 # Demo: two robots, two waypoints, one duplicate to be rejected            #

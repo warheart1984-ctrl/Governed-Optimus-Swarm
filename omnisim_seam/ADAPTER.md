@@ -1,10 +1,12 @@
 # OmniSim seam adapter — pose-billed routes
 
 This note covers the adapter-side polish on `omnisim_seam`. It does **not**
-change OmniSim physics, turn-control, or the completion contract OmniLink
-owns. The physical Husky miss was a turn-control failure on their path;
-we are not rerunning against that known-failing path, and we are not
-patching their physics layer.
+change OmniSim physics or the completion contract OmniLink owns. The
+physical Husky miss is treated as a bridge/control gain failure on their
+path. This adapter now carries a temporary, evidence-bound turn-gain
+compensation for the current failing Husky NE replay so future reruns can
+be audited without relabeling the upstream mechanical/control issue as
+fixed.
 
 This is a **Governed Runtime Control Plane Prototype**, not a certified
 production system. `--live` stays off. This work does not fix OmniSim
@@ -113,6 +115,21 @@ ticket, installs a new immutable manifest copy, and logs a receipt.
    result (5.1111 m and 7.0711 m misses) remains governing. `--live`
    stays off until OmniLink sends a physics fix commit.
 
+8. **Temporary Husky NE turn-gain compensation.** The v8.3 replay for
+   `omnilink_husky_swarm.omniworld` on build `7d39130cf` reported a
+   commanded +90 deg turn settling at +9.319384209870012 deg. That gives
+   an end-to-end bridge gain ratio of about `0.1035` and a reciprocal
+   multiplier of about `9.66`. For `husky_ne`, the adapter sends both:
+
+   - `turn_gain_multiplier`
+   - `turn_gain_calibration`
+
+   The calibration record includes the commanded/achieved angles,
+   `wheel_radius_m=0.165`, `track_width_m=0.555`, and the differential
+   drive factor `track_width / (2 * wheel_radius)`. This is an interim
+   control-side compensation only; the real bridge PID should compute the
+   yaw-error-to-wheel-velocity gain from the physical constants upstream.
+
 ## Why
 
 The previous wait was `hypot(waypoint − spawn)`. Spawn is a table entry,
@@ -148,7 +165,10 @@ path-following accuracy.
 The adapter still does not estimate slip, curvature, or turn rate. Those
 stay on the OmniSim side of the seam. This attribution logger does not
 change that, and it is not a green light to rerun `--live`. The last live
-four-Husky miss (5.1111 m / 7.0711 m) remains the governing result.
+four-Husky miss (5.1111 m / 7.0711 m) remains the governing result. The
+turn-gain field is scoped to the measured Husky NE bridge regression and
+is meant to be removed once the OmniLink bridge computes the physical gain
+correctly.
 
 ## How it interacts with the completion gate
 

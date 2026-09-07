@@ -87,6 +87,13 @@ the **observed starting pose** (configured spawn is fallback only); use
 particular bridge. Adapter-side notes, defensive checks, and the
 completion-gate contract: [`omnisim_seam/ADAPTER.md`](omnisim_seam/ADAPTER.md).
 
+For the current `omnilink_husky_swarm.omniworld` v8.3 replay on build
+`7d39130cf`, `husky_ne` has a temporary, evidence-bound turn-gain
+compensation: +90 deg commanded produced +9.319384209870012 deg achieved,
+so the adapter emits a reciprocal `turn_gain_multiplier` of about `9.66`
+with the dispatch. This is explicitly an interim bridge-control
+compensation, not a claim that OmniSim physics is fixed.
+
 Offline rerun (no OmniSim required):
 
 ```bash

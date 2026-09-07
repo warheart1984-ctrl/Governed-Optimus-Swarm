@@ -28,9 +28,11 @@ from omnisim_seam import (
     Assignment,
     AssignmentEnvelope,
     Adapter,
+    DEFAULT_TURN_GAIN_CALIBRATIONS,
     EvidenceRecord,
     OmniSimMobile,
     SPAWN_LOCATIONS,
+    TurnGainCalibration,
     WAYPOINTS,
     GET_ROBOT_STATE_PATH,
     TELEMETRY_POLL_PATH,
@@ -378,6 +380,55 @@ def test_drive_timeout_uses_observed_start_pose():
         start_pose={"pose": [10.0, -2.0], "yaw": 0.0},
     )
     assert captured["timeout_s"] == 13.0  # 10 m at 1 m/s, plus 3 s settling
+
+
+def test_turn_gain_calibration_matches_husky_ne_replay():
+    calibration = DEFAULT_TURN_GAIN_CALIBRATIONS["husky_ne"]
+    assert calibration.world_id == "omnilink_husky_swarm.omniworld"
+    assert calibration.build_id == "7d39130cf"
+    assert calibration.gain_ratio == pytest.approx(0.10354871344300014)
+    assert calibration.multiplier == pytest.approx(9.657290748156253)
+    assert calibration.differential_drive_factor == pytest.approx(1.6818181818181817)
+
+
+def test_husky_ne_dispatch_sends_turn_gain_calibration():
+    mobile = OmniSimMobile(
+        "husky_ne", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"],
+        {"wp_x": WAYPOINTS["wp_x"]},
+    )
+    captured = {}
+    mobile._post = lambda path, body, timeout_s=None: captured.update(path=path, body=body, timeout_s=timeout_s) or {}  # type: ignore[method-assign]
+    reply = mobile.dispatch(
+        Assignment("husky_ne", "go_to_wp_x", "wp_x", "navigate", "req-turn"),
+        start_pose={"pose": [0.0, -2.0], "yaw": 0.0},
+    )
+    assert captured["path"] == "/drive_to_waypoint"
+    assert captured["body"]["turn_gain_multiplier"] == pytest.approx(9.657290748156253)
+    assert captured["body"]["turn_gain_calibration"]["gain_ratio"] == pytest.approx(0.10354871344300014)
+    assert reply["turn_gain_calibration"]["build_id"] == "7d39130cf"
+
+
+def test_custom_turn_gain_calibration_overrides_default():
+    calibration = TurnGainCalibration(
+        world_id="test_world",
+        build_id="test_build",
+        robot_id="robot_a",
+        commanded_deg=90.0,
+        achieved_deg=45.0,
+    )
+    mobile = OmniSimMobile(
+        "robot_a", "http://127.0.0.1:1", SPAWN_LOCATIONS["robot_a"],
+        {"wp_x": WAYPOINTS["wp_x"]},
+        turn_gain_calibrations={"robot_a": calibration},
+    )
+    captured = {}
+    mobile._post = lambda path, body, timeout_s=None: captured.update(body=body) or {}  # type: ignore[method-assign]
+    mobile.dispatch(
+        Assignment("robot_a", "go_to_wp_x", "wp_x", "navigate", "req-turn"),
+        start_pose={"pose": [0.0, -2.0], "yaw": 0.0},
+    )
+    assert captured["body"]["turn_gain_multiplier"] == pytest.approx(2.0)
+    assert captured["body"]["turn_gain_calibration"]["world_id"] == "test_world"
 
 
 def test_implausible_start_pose_aborts_without_http():
