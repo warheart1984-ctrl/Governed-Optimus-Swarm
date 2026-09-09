@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Rule categorisation (mirrors the analysis in test_quarantine_recovery_path)
@@ -179,5 +179,9 @@ class RecoveryPolicy:
         state.cooldown = left
         if left <= 0:
             state.state = "idle"
-            # robot.task is set by the caller (orchestrator), not here.
-            # The orchestrator should robot.task = "idle" after this returns.
+            robot.task = "idle"
+
+    def re_evaluate_all(self, robots: Iterable[Any]) -> None:
+        """Advance recovery cooldowns for all quarantined robots."""
+        for robot in robots:
+            self.tick(robot)

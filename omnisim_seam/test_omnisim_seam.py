@@ -565,3 +565,21 @@ def test_omnisim_mobile_poll_telemetry_falls_back_to_get_robot_state():
     assert posts == [TELEMETRY_POLL_PATH, GET_ROBOT_STATE_PATH]
     assert st["pose"] == [3.0, 4.0]
     assert "raw_world_root" not in st  # not invented on the fallback body
+
+
+def test_recover_robot_records_one_evidence_entry(adapter_factory):
+    ad = adapter_factory()
+    ad.envelope._open["robot_a"] = {
+        "request_id": "req-robot_a-stuck",
+        "target": "wp_x",
+    }
+
+    before = len(ad.evidence)
+    rec = ad.recover_robot("robot_a")
+
+    assert len(ad.evidence) == before + 1
+    assert "robot_a" not in ad.envelope._open
+    assert rec is ad.evidence[-1]
+    assert rec.request_id == "recover-robot_a"
+    assert rec.outcome == "aborted"
+    assert rec.assignment["recovered_request_id"] == "req-robot_a-stuck"

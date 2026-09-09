@@ -9,19 +9,29 @@ from control_plane import (
 from spatial_model import DuplicateRobotIdError, FloorModel, Robot, TaskNode, Vec2
 from specialist_registry import SpecialistRegistry
 from swarm_law import SwarmLaw, LawViolation
+from swarm_recovery import RecoveryPolicy
 
 
 class GovernedSwarm:
     """
     Governed multi-robot swarm.
     Every robot action is passed through SwarmLaw before being committed.
-    A robot that violates law is locked immediately — no recovery in this step.
+    Recoverable law violations enter quarantine and cool down before retry.
     """
 
-    def __init__(self, model: FloorModel, registry: SpecialistRegistry) -> None:
+    def __init__(
+        self,
+        model: FloorModel,
+        registry: SpecialistRegistry,
+        recovery_policy: Optional[RecoveryPolicy] = None,
+        re_evaluate_interval_ticks: int = 1,
+    ) -> None:
         self.model = model
         self.registry = registry
         self.law = SwarmLaw(registry)
+        self.recovery = recovery_policy or RecoveryPolicy()
+        self.re_evaluate_interval_ticks = max(1, re_evaluate_interval_ticks)
+        self._tick_count = 0
         self.log: List[Dict[str, Any]] = []
 
         ids = [r.id for r in model.robots]
@@ -92,6 +102,9 @@ class GovernedSwarm:
         if robot.task == "locked":
             self.log.append({"robot": robot.id, "event": "skipped_locked"})
             return
+        if robot.task == "quarantined":
+            self.log.append({"robot": robot.id, "event": "skipped_quarantined"})
+            return
 
         old_pos = robot.pos
         old_task = robot.task
@@ -119,11 +132,15 @@ class GovernedSwarm:
                 bound_role=bound_role,
             )
         except LawViolation as e:
-            robot.task = "locked"
+            detail = str(e)
+            rule_id = detail.split(":", 1)[0]
+            decision = self.recovery.on_violation(robot.id, rule_id)
+            robot.task = decision["state"]
             self.log.append({
                 "robot": robot.id,
                 "event": "law_violation",
-                "detail": str(e),
+                "detail": detail,
+                "recovery": decision,
                 "state_hash": self._hash_snapshot(),
             })
             return
@@ -153,6 +170,10 @@ class GovernedSwarm:
     # ------------------------------------------------------------------ #
 
     def step(self) -> None:
+        self._tick_count += 1
+        if self._tick_count % self.re_evaluate_interval_ticks == 0:
+            self.recovery.re_evaluate_all(self.model.robots)
+
         # reset per-tick claims
         self.model.reset_claims()
         for robot in self.model.robots:
@@ -217,4 +238,4 @@ class GovernedSwarm:
         return [r.id for r in self.model.robots if r.task == "locked"]
 
     def active_robots(self) -> int:
-        return sum(1 for r in self.model.robots if r.task != "locked")
+        return sum(1 for r in self.model.robots if r.task not in {"locked", "quarantined"})
