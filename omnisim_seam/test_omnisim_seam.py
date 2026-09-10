@@ -265,6 +265,44 @@ def test_no_double_dispatch_on_duplicate():
     assert robots["robot_a"].dispatches == []    # nothing sent yet
 
 
+def test_adapter_run_rejects_duplicate_without_exception():
+    """Calling Adapter.run on an in-flight duplicate returns a rejected_duplicate
+    EvidenceRecord with empty observations, no dispatch, and no exception.
+
+    Regression test for: UnboundLocalError on 'before' in is_duplicate branch
+    (introduced when observe() was removed from that path but raw_world_root/
+    odometry_pose still referenced it).
+    """
+    robots = {"robot_a": FakeMobile("robot_a")}
+    ad = Adapter(robots)  # type: ignore[arg-type]
+
+    # Seed an in-flight assignment WITHOUT completing it (no mark_terminal).
+    ad.envelope.from_swarm_log(dict(SWARM_LINE_A))
+
+    # Now call Adapter.run on the SAME assignment - this is a true in-flight duplicate.
+    rec = ad.run(dict(SWARM_LINE_A))
+
+    # Should return EvidenceRecord, not raise UnboundLocalError
+    assert rec is not None
+    assert rec.outcome == "rejected_duplicate"
+    assert rec.accepted is False
+    assert rec.dispatch == {}
+    assert rec.observation_before == {}
+    assert rec.observation_after == {}
+    # Geometry-attribution fields should be None / [None, None] (not crash)
+    assert rec.raw_world_root == [None, None]
+    assert rec.odometry_pose is None
+    assert rec.bridge_x is None
+    assert rec.bridge_y is None
+    assert rec.bridge_yaw is None
+    assert rec.cmd_vel_linear_x is None
+    assert rec.cmd_vel_angular_z is None
+    assert rec.world_dx_dt is None
+    assert rec.world_dy_dt is None
+    # No OmniSim dispatch should have been attempted
+    assert robots["robot_a"].dispatches == []
+
+
 # ------------------------------------------------------------------------- #
 # 4. Terminal outcome frees the request id                                  #
 # ------------------------------------------------------------------------- #
